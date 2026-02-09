@@ -118,6 +118,46 @@ def init_tables(conn: sqlite3.Connection | None = None) -> None:
             strategy_total_return_pct REAL
         );
 
+        CREATE TABLE IF NOT EXISTS pregame (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+
+            -- Flow sentiment (aggregated from multiple polls)
+            flow_samples INTEGER DEFAULT 0,
+            flow_put_premium_total REAL DEFAULT 0,
+            flow_call_premium_total REAL DEFAULT 0,
+            flow_avg_ratio REAL DEFAULT 1.0,
+            flow_trend TEXT,
+            flow_bearish_samples INTEGER DEFAULT 0,
+
+            -- Intraday QQQ movement
+            qqq_open REAL,
+            qqq_current REAL,
+            qqq_intraday_pct REAL,
+            qqq_intraday_high REAL,
+            qqq_intraday_low REAL,
+            qqq_intraday_range_pct REAL,
+
+            -- TQQQ intraday
+            tqqq_open REAL,
+            tqqq_current REAL,
+            tqqq_intraday_pct REAL,
+
+            -- Volume analysis
+            qqq_volume INTEGER,
+            qqq_avg_volume INTEGER,
+            qqq_relative_volume REAL,
+
+            -- Late-day momentum (last hour direction)
+            qqq_last_hour_pct REAL,
+            selling_into_close INTEGER DEFAULT 0,
+
+            -- Summary
+            pregame_sentiment TEXT,
+            pregame_notes TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS backtest_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT NOT NULL,
@@ -334,3 +374,43 @@ def get_performance_summary(
         "worst_day": min(pnls),
         "latest_total_return_pct": rows[0]["strategy_total_return_pct"] or 0,
     }
+
+
+def save_pregame(data: dict, conn: sqlite3.Connection | None = None) -> None:
+    """Save pregame intelligence report."""
+    close_after = False
+    if conn is None:
+        conn = get_connection()
+        close_after = True
+
+    columns = list(data.keys())
+    placeholders = ", ".join(["?"] * len(columns))
+    col_str = ", ".join(columns)
+
+    conn.execute(
+        f"INSERT INTO pregame ({col_str}) VALUES ({placeholders})",
+        [data[c] for c in columns],
+    )
+    conn.commit()
+
+    if close_after:
+        conn.close()
+
+
+def get_today_pregame(conn: sqlite3.Connection | None = None) -> dict | None:
+    """Get today's pregame report if it exists."""
+    close_after = False
+    if conn is None:
+        conn = get_connection()
+        close_after = True
+
+    today_str = date.today().isoformat()
+    row = conn.execute(
+        "SELECT * FROM pregame WHERE date = ? ORDER BY id DESC LIMIT 1",
+        [today_str],
+    ).fetchone()
+
+    if close_after:
+        conn.close()
+
+    return dict(row) if row else None

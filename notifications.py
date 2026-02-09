@@ -130,8 +130,16 @@ def send_daily_report(data: dict) -> bool:
         f"Target: ${target_val:,.0f} of ${allocated:,.0f} allocated\n\n"
         f"Position: {current_shares} shares TQQQ (${tqqq_value:,.0f})\n"
         f"P/L: {tqqq_pnl:+.1f}%\n"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
     )
+
+    # Pregame intel if available
+    if data.get("pregame_sentiment"):
+        text += (
+            f"\nPre-Game: {data['pregame_sentiment']}\n"
+            f"  {data.get('pregame_notes', '')}\n"
+        )
+
+    text += f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
 
     return _send_message(text, parse_mode="")
 

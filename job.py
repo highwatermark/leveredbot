@@ -5,6 +5,7 @@ CLI entry point for the leveraged ETF strategy.
 Usage:
     python job.py run               # Execute daily strategy
     python job.py run --halfday-check  # Only run if today is a half day
+    python job.py pregame           # Pre-execution intel gathering (3:30 PM)
     python job.py status            # Show current state without trading
     python job.py backtest          # Run historical backtest
     python job.py force_exit        # Emergency exit all TQQQ
@@ -205,11 +206,198 @@ def _compute_signals(data: dict) -> dict:
     }
 
 
+def cmd_pregame():
+    """
+    Pre-execution intelligence gathering. Runs at 3:30 PM EST.
+
+    Polls UW flow sentiment 4 times over 20 minutes, tracks QQQ intraday
+    movement, checks volume, and writes a summary for the 3:50 PM run.
+    """
+    import time
+    import alpaca_client
+    import uw_client
+    from db.models import init_tables, save_pregame
+    import notifications
+
+    logger.info(f"{'='*50}")
+    logger.info(f"Leveraged ETF Strategy - PREGAME - {_timestamp()}")
+    logger.info(f"{'='*50}")
+
+    init_tables()
+
+    # Check market is open
+    today_str = date.today().isoformat()
+    calendar = alpaca_client.get_calendar(today_str)
+    if calendar is None:
+        logger.info("Market closed today, skipping pregame")
+        return
+
+    # Get snapshots for intraday data
+    snapshots = alpaca_client.get_snapshot(
+        [LEVERAGE_CONFIG["underlying"], LEVERAGE_CONFIG["bull_etf"]]
+    )
+
+    qqq_snap = snapshots.get("QQQ", {})
+    tqqq_snap = snapshots.get("TQQQ", {})
+
+    qqq_open = qqq_snap.get("daily_bar_open", 0)
+    qqq_current = qqq_snap.get("latest_trade_price", 0)
+    qqq_high = qqq_snap.get("daily_bar_high", 0)
+    qqq_low = qqq_snap.get("daily_bar_low", 0)
+    qqq_volume = qqq_snap.get("daily_bar_volume", 0)
+
+    tqqq_open = tqqq_snap.get("daily_bar_open", 0)
+    tqqq_current = tqqq_snap.get("latest_trade_price", 0)
+
+    # Intraday calculations
+    qqq_intraday_pct = ((qqq_current - qqq_open) / qqq_open * 100) if qqq_open else 0
+    tqqq_intraday_pct = ((tqqq_current - tqqq_open) / tqqq_open * 100) if tqqq_open else 0
+    qqq_range_pct = ((qqq_high - qqq_low) / qqq_low * 100) if qqq_low else 0
+
+    # Poll UW flow multiple times (4 polls, 5 min apart = 20 min coverage)
+    flow_samples = []
+    poll_count = 4
+    poll_interval = 300  # 5 minutes
+
+    logger.info(f"Starting {poll_count} flow polls (every {poll_interval//60} min)...")
+
+    for i in range(poll_count):
+        if i > 0:
+            time.sleep(poll_interval)
+
+        flow = uw_client.get_tqqq_flow()
+        flow_samples.append(flow)
+        logger.info(
+            f"  Poll {i+1}/{poll_count}: P/C ratio={flow['ratio']:.2f} "
+            f"puts=${flow['put_premium']:,.0f} calls=${flow['call_premium']:,.0f} "
+            f"alerts={flow['alert_count']}"
+        )
+
+    # Aggregate flow data
+    total_put = sum(f["put_premium"] for f in flow_samples)
+    total_call = sum(f["call_premium"] for f in flow_samples)
+    avg_ratio = (total_put / total_call) if total_call > 0 else (10.0 if total_put > 0 else 1.0)
+    bearish_count = sum(1 for f in flow_samples if f["is_bearish"])
+
+    # Determine flow trend
+    if len(flow_samples) >= 2:
+        ratios = [f["ratio"] for f in flow_samples]
+        if ratios[-1] > ratios[0] * 1.3:
+            flow_trend = "INCREASINGLY_BEARISH"
+        elif ratios[-1] < ratios[0] * 0.7:
+            flow_trend = "INCREASINGLY_BULLISH"
+        else:
+            flow_trend = "STABLE"
+    else:
+        flow_trend = "INSUFFICIENT_DATA"
+
+    # Estimate relative volume (vs 20-day average from daily bars)
+    # Use cached bars if available
+    qqq_avg_volume = 0
+    try:
+        from db.cache import get_cached_bars
+        cached = get_cached_bars("QQQ", 20)
+        if cached:
+            qqq_avg_volume = int(sum(b["volume"] for b in cached) / len(cached))
+    except Exception:
+        pass
+
+    relative_volume = (qqq_volume / qqq_avg_volume) if qqq_avg_volume > 0 else 0
+
+    # Late-day check: get a fresh snapshot after polling
+    try:
+        fresh_snap = alpaca_client.get_snapshot([LEVERAGE_CONFIG["underlying"]])
+        qqq_latest = fresh_snap.get("QQQ", {}).get("latest_trade_price", qqq_current)
+        qqq_last_hour_pct = ((qqq_latest - qqq_current) / qqq_current * 100) if qqq_current else 0
+        selling_into_close = qqq_latest < qqq_current and qqq_intraday_pct > 0
+    except Exception:
+        qqq_latest = qqq_current
+        qqq_last_hour_pct = 0
+        selling_into_close = False
+
+    # Overall sentiment assessment
+    notes = []
+    if abs(qqq_intraday_pct) > 2:
+        notes.append(f"Large QQQ move: {qqq_intraday_pct:+.1f}%")
+    if relative_volume > 1.5:
+        notes.append(f"High volume: {relative_volume:.1f}x avg")
+    if bearish_count >= 3:
+        notes.append(f"Persistent bearish flow ({bearish_count}/{poll_count} polls)")
+    if flow_trend == "INCREASINGLY_BEARISH":
+        notes.append("Flow deteriorating into close")
+    if selling_into_close:
+        notes.append("Selling into close (gave up intraday gains)")
+    if qqq_range_pct > 3:
+        notes.append(f"Wide intraday range: {qqq_range_pct:.1f}%")
+
+    if bearish_count >= 3 or (selling_into_close and avg_ratio > 1.5):
+        sentiment = "BEARISH"
+    elif bearish_count == 0 and qqq_intraday_pct > 0.5 and flow_trend != "INCREASINGLY_BEARISH":
+        sentiment = "BULLISH"
+    else:
+        sentiment = "NEUTRAL"
+
+    # Save to DB
+    pregame_data = {
+        "date": today_str,
+        "timestamp": _timestamp(),
+        "flow_samples": poll_count,
+        "flow_put_premium_total": round(total_put, 2),
+        "flow_call_premium_total": round(total_call, 2),
+        "flow_avg_ratio": round(avg_ratio, 2),
+        "flow_trend": flow_trend,
+        "flow_bearish_samples": bearish_count,
+        "qqq_open": qqq_open,
+        "qqq_current": qqq_latest,
+        "qqq_intraday_pct": round(qqq_intraday_pct, 2),
+        "qqq_intraday_high": qqq_high,
+        "qqq_intraday_low": qqq_low,
+        "qqq_intraday_range_pct": round(qqq_range_pct, 2),
+        "tqqq_open": tqqq_open,
+        "tqqq_current": tqqq_current,
+        "tqqq_intraday_pct": round(tqqq_intraday_pct, 2),
+        "qqq_volume": qqq_volume,
+        "qqq_avg_volume": qqq_avg_volume,
+        "qqq_relative_volume": round(relative_volume, 2),
+        "qqq_last_hour_pct": round(qqq_last_hour_pct, 2),
+        "selling_into_close": 1 if selling_into_close else 0,
+        "pregame_sentiment": sentiment,
+        "pregame_notes": "; ".join(notes) if notes else "No notable signals",
+    }
+    save_pregame(pregame_data)
+
+    # Send Telegram summary
+    text = (
+        f"\U0001f3af Pre-Game Intel ({today_str})\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"Sentiment: {sentiment}\n\n"
+        f"QQQ Today: {qqq_intraday_pct:+.2f}% (${qqq_latest:.2f})\n"
+        f"  Range: ${qqq_low:.2f} - ${qqq_high:.2f} ({qqq_range_pct:.1f}%)\n"
+        f"  Volume: {qqq_volume:,} ({relative_volume:.1f}x avg)\n\n"
+        f"TQQQ Today: {tqqq_intraday_pct:+.2f}% (${tqqq_current:.2f})\n\n"
+        f"Flow ({poll_count} polls over 20 min):\n"
+        f"  Avg P/C ratio: {avg_ratio:.2f}\n"
+        f"  Trend: {flow_trend}\n"
+        f"  Bearish polls: {bearish_count}/{poll_count}\n"
+    )
+    if notes:
+        text += f"\nFlags:\n"
+        for n in notes:
+            text += f"  \u26a0\ufe0f {n}\n"
+    text += f"\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+    text += f"Execution in ~20 min"
+
+    notifications._send_message(text, parse_mode="")
+
+    logger.info(f"Pregame complete: {sentiment}")
+    logger.info(f"Notes: {'; '.join(notes) if notes else 'None'}")
+
+
 def cmd_run(halfday_check: bool = False):
     """Execute the daily strategy pipeline."""
     from strategy.sizing import run_gate_checklist, calculate_target_shares
     from strategy.executor import execute_rebalance
-    from db.models import init_tables, log_daily_decision, log_regime_change, log_daily_performance
+    from db.models import init_tables, log_daily_decision, log_regime_change, log_daily_performance, get_today_pregame
     import alpaca_client
     import notifications
 
@@ -244,6 +432,21 @@ def cmd_run(halfday_check: bool = False):
 
     # Compute signals
     signals = _compute_signals(data)
+
+    # Check for pregame intel
+    pregame = get_today_pregame()
+    if pregame:
+        logger.info(f"Pregame intel: sentiment={pregame['pregame_sentiment']}, "
+                     f"flow_ratio={pregame['flow_avg_ratio']:.2f}, "
+                     f"notes={pregame['pregame_notes']}")
+        # Override flow data with pregame aggregated data if available
+        if pregame["flow_samples"] and pregame["flow_samples"] > 0:
+            signals["options_flow_ratio"] = pregame["flow_avg_ratio"]
+            signals["options_flow_bearish"] = pregame["flow_bearish_samples"] >= 3
+            if signals["options_flow_bearish"]:
+                signals["options_flow_adjustment"] = 0.5
+    else:
+        logger.info("No pregame intel available for today")
 
     # Run gate checklist
     gate_data = {
@@ -425,6 +628,9 @@ def cmd_run(halfday_check: bool = False):
         "tqqq_position_value": tqqq_val,
         "tqqq_pnl_pct": perf["tqqq_pnl_pct"],
     }
+    if pregame:
+        report_data["pregame_sentiment"] = pregame["pregame_sentiment"]
+        report_data["pregame_notes"] = pregame["pregame_notes"]
     notifications.send_daily_report(report_data)
 
     logger.info("Daily run complete")
@@ -799,8 +1005,9 @@ def cmd_force_exit():
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python job.py {run|status|backtest|force_exit}")
+        print("Usage: python job.py {run|pregame|status|backtest|force_exit}")
         print("  run [--halfday-check]  Execute daily strategy")
+        print("  pregame                Pre-execution intel gathering (3:30 PM)")
         print("  status                 Show current state (no trading)")
         print("  backtest               Run historical backtest")
         print("  force_exit             Emergency sell all TQQQ")
@@ -811,6 +1018,8 @@ def main():
     if command == "run":
         halfday = "--halfday-check" in sys.argv
         cmd_run(halfday_check=halfday)
+    elif command == "pregame":
+        cmd_pregame()
     elif command == "status":
         cmd_status()
     elif command == "backtest":
