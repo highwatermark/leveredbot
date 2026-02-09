@@ -13,7 +13,7 @@ import logging
 from datetime import datetime, date, timedelta
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, GetCalendarRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest
@@ -165,7 +165,7 @@ def get_calendar(target_date: str) -> dict | None:
     def _call():
         client = _get_trading_client()
         cal = client.get_calendar(
-            filters={"start": target_date, "end": target_date}
+            filters=GetCalendarRequest(start=target_date, end=target_date)
         )
         if not cal:
             return None
