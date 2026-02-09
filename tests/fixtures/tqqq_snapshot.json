@@ -1,0 +1,10 @@
+{
+  "latest_trade_price": 50.64,
+  "latest_trade_time": "2025-01-15T15:45:00-05:00",
+  "daily_bar_close": 50.50,
+  "daily_bar_open": 49.80,
+  "daily_bar_high": 50.80,
+  "daily_bar_low": 49.60,
+  "daily_bar_volume": 120000000,
+  "prev_daily_bar_close": 49.90
+}

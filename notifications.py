@@ -1,0 +1,215 @@
+"""
+Telegram notification formatting and sending.
+
+Sends daily reports, regime alerts, half-day alerts, errors,
+and backtest summaries. Uses httpx for direct Bot API calls.
+"""
+
+import logging
+from pathlib import Path
+
+import httpx
+
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_ID
+
+logger = logging.getLogger(__name__)
+
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+TIMEOUT = 15
+
+
+def _send_message(text: str, parse_mode: str = "HTML") -> bool:
+    """Send a message via Telegram Bot API."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_ID:
+        logger.warning("Telegram not configured, skipping notification")
+        print(text)  # Print to stdout as fallback
+        return False
+
+    try:
+        with httpx.Client(timeout=TIMEOUT) as client:
+            resp = client.post(
+                f"{TELEGRAM_API}/sendMessage",
+                json={
+                    "chat_id": TELEGRAM_ADMIN_ID,
+                    "text": text,
+                    "parse_mode": parse_mode,
+                },
+            )
+            resp.raise_for_status()
+            return True
+    except Exception as e:
+        logger.error(f"Telegram send failed: {e}")
+        print(f"[Telegram failed] {text}")
+        return False
+
+
+def _send_document(file_path: str, caption: str = "") -> bool:
+    """Send a file via Telegram Bot API."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_ID:
+        logger.warning("Telegram not configured, skipping file send")
+        return False
+
+    try:
+        with httpx.Client(timeout=30) as client:
+            with open(file_path, "rb") as f:
+                resp = client.post(
+                    f"{TELEGRAM_API}/sendDocument",
+                    data={"chat_id": TELEGRAM_ADMIN_ID, "caption": caption},
+                    files={"document": (Path(file_path).name, f)},
+                )
+                resp.raise_for_status()
+                return True
+    except Exception as e:
+        logger.error(f"Telegram file send failed: {e}")
+        return False
+
+
+def send_daily_report(data: dict) -> bool:
+    """Send formatted daily strategy report."""
+    regime = data.get("regime", "UNKNOWN")
+    regime_emoji = {
+        "STRONG_BULL": "\U0001f7e2", "BULL": "\U0001f7e2",
+        "CAUTIOUS": "\U0001f7e1", "RISK_OFF": "\U0001f534",
+        "BREAKDOWN": "\U0001f534",
+    }.get(regime, "\u26aa")
+
+    regime_days = data.get("regime_days", "?")
+    qqq_close = data.get("qqq_close", 0)
+    sma_50 = data.get("qqq_sma_50", 0)
+    sma_250 = data.get("qqq_sma_250", 0)
+    pct_sma50 = data.get("qqq_pct_above_sma50", 0)
+    pct_sma250 = data.get("qqq_pct_above_sma250", 0)
+
+    momentum = data.get("momentum_score", 0)
+    mom_label = "Strong" if momentum > 0.6 else "Moderate" if momentum > 0.3 else "Weak"
+
+    vol = data.get("realized_vol_20d", 0)
+    vol_regime = data.get("vol_regime", "UNKNOWN")
+
+    flow_ratio = data.get("options_flow_ratio", 0)
+    flow_label = "Bearish" if data.get("options_flow_bearish") else "Neutral"
+
+    trading_days = data.get("trading_days_fetched", 0)
+    gates = data.get("gates_passed", 0)
+    gates_total = gates + len(data.get("gates_failed_list", []))
+    gate_str = f"\u2705 All {gates_total} gates passed" if not data.get("gates_failed_list") else f"\u274c {len(data.get('gates_failed_list', []))} gates failed"
+
+    action = data.get("order_action", "HOLD")
+    order_shares = data.get("order_shares", 0)
+    target_val = data.get("target_dollar_value", 0)
+    allocated = data.get("allocated_capital", 0)
+
+    current_shares = data.get("current_shares", 0)
+    tqqq_value = data.get("tqqq_position_value", 0)
+    tqqq_pnl = data.get("tqqq_pnl_pct", 0)
+    day_trades = data.get("day_trades_remaining", "?")
+
+    text = (
+        f"\U0001f4ca Leveraged ETF Daily Report\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"Regime: {regime_emoji} {regime} (Day {regime_days})\n"
+        f"QQQ: ${qqq_close:.2f}\n"
+        f"  \u2514 SMA50: ${sma_50:.2f} ({pct_sma50:+.1f}% above)\n"
+        f"  \u2514 SMA250: ${sma_250:.2f} ({pct_sma250:+.1f}% above)\n\n"
+        f"Momentum: {momentum:.2f} ({mom_label})\n"
+        f"Realized Vol: {vol:.1f}% ({vol_regime})\n"
+        f"Options Flow: {flow_label} (P/C ratio: {flow_ratio:.1f})\n\n"
+        f"Data Quality: \u2705 {trading_days} trading days loaded\n"
+        f"Gate Check: {gate_str}\n"
+        f"PDT Status: {day_trades} day trades remaining\n\n"
+        f"Action: {action}"
+    )
+
+    if action in ("BUY", "SELL", "REBALANCE") and order_shares:
+        side = "Buy" if action == "BUY" else "Sell"
+        text += f" \u2192 {side} {abs(order_shares)} shares TQQQ\n"
+    else:
+        text += "\n"
+
+    text += (
+        f"Target: ${target_val:,.0f} of ${allocated:,.0f} allocated\n\n"
+        f"Position: {current_shares} shares TQQQ (${tqqq_value:,.0f})\n"
+        f"P/L: {tqqq_pnl:+.1f}%\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+    )
+
+    return _send_message(text, parse_mode="")
+
+
+def send_regime_alert(old: str | None, new: str, data: dict) -> bool:
+    """Send regime change alert."""
+    qqq_close = data.get("qqq_close", 0)
+    sma_250 = data.get("qqq_sma_250", 0)
+    vol = data.get("realized_vol_20d", 0)
+    vol_regime = data.get("vol_regime", "")
+    flow_ratio = data.get("options_flow_ratio", 0)
+    flow_label = "Bearish" if data.get("options_flow_bearish") else "Neutral"
+
+    pct_sma250 = ((qqq_close / sma_250) - 1) * 100 if sma_250 else 0
+    above_below = "above" if pct_sma250 >= 0 else "below"
+
+    action = data.get("action_description", "No action")
+
+    text = (
+        f"\U0001f6a8 REGIME CHANGE ALERT\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"{old or 'NONE'} \u2192 {new}\n\n"
+        f"QQQ: ${qqq_close:.2f} ({abs(pct_sma250):.1f}% {above_below} SMA250)\n"
+        f"Realized Vol: {vol:.1f}% ({vol_regime})\n"
+        f"Options Flow: {flow_label} (P/C ratio: {flow_ratio:.1f})\n\n"
+        f"ACTION: {action}\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+    )
+
+    return _send_message(text, parse_mode="")
+
+
+def send_halfday_alert() -> bool:
+    """Send half-day detection alert."""
+    text = (
+        "\u23f0 HALF DAY DETECTED\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        "Market closes at 1:00 PM EST today\n"
+        "Execution moved to 12:45 PM EST\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+    )
+    return _send_message(text, parse_mode="")
+
+
+def send_error(title: str, detail: str) -> bool:
+    """Send error notification."""
+    text = f"\u26a0\ufe0f {title}\n\n{detail}"
+    return _send_message(text, parse_mode="")
+
+
+def send_backtest_summary(stats: dict, csv_path: str | None = None) -> bool:
+    """Send backtest results summary and optionally the CSV file."""
+    total_return = stats.get("total_return_pct", 0)
+    max_dd = stats.get("max_drawdown_pct", 0)
+    qqq_return = stats.get("qqq_buy_hold_pct", 0)
+    tqqq_return = stats.get("tqqq_buy_hold_pct", 0)
+    num_trades = stats.get("num_trades", 0)
+    days_in_market = stats.get("days_in_market", 0)
+    total_days = stats.get("total_days", 0)
+    start_date = stats.get("start_date", "?")
+    end_date = stats.get("end_date", "?")
+
+    text = (
+        f"\U0001f4c8 Backtest Results ({start_date} to {end_date})\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"Strategy Return: {total_return:+.1f}%\n"
+        f"Max Drawdown: {max_dd:.1f}%\n"
+        f"Trades: {num_trades}\n"
+        f"Days in Market: {days_in_market}/{total_days} ({days_in_market/total_days*100:.0f}%)\n\n"
+        f"Benchmarks:\n"
+        f"  QQQ Buy & Hold: {qqq_return:+.1f}%\n"
+        f"  TQQQ Buy & Hold: {tqqq_return:+.1f}%\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+    )
+
+    result = _send_message(text, parse_mode="")
+
+    if csv_path:
+        _send_document(csv_path, caption="Backtest full results")
+
+    return result
