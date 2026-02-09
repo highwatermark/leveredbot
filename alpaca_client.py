@@ -137,7 +137,7 @@ def get_bars(symbol: str, start: str, end: str) -> list[dict]:
         )
         bars = client.get_stock_bars(request)
         result = []
-        bar_set = bars[symbol] if symbol in bars else []
+        bar_set = bars.data.get(symbol, [])
         for bar in bar_set:
             result.append({
                 "date": bar.timestamp.date().isoformat(),
