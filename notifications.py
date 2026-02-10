@@ -214,6 +214,77 @@ def send_error(title: str, detail: str) -> bool:
     return _send_message(text, parse_mode="")
 
 
+def send_position_exit_alert(event_data: dict) -> bool:
+    """Send Telegram alert for a position exit event."""
+    exit_type = event_data.get("exit_type", "UNKNOWN")
+    emoji = {
+        "STOP_LOSS": "\U0001f6d1",       # stop sign
+        "TRAILING_STOP": "\U0001f4c9",    # chart decreasing
+        "GAP_DOWN": "\u26a1",             # lightning
+        "VOL_SPIKE": "\U0001f4a5",        # collision
+        "REGIME_EMERGENCY": "\U0001f6a8", # rotating light
+        "MAX_HOLD": "\u23f0",             # alarm clock
+        "DAILY_LOSS_LIMIT": "\U0001f198", # SOS
+        "PARTIAL_PROFIT": "\U0001f4b0",   # money bag
+    }.get(exit_type, "\u26a0\ufe0f")
+
+    urgency_label = " [URGENT]" if event_data.get("urgency") == "URGENT" else ""
+    symbol = event_data.get("symbol", "???")
+    shares = event_data.get("shares_sold", 0)
+    price = event_data.get("price", 0)
+    pnl = event_data.get("pnl_pct", 0)
+    reason = event_data.get("reason", "")
+    window = event_data.get("window", "")
+
+    text = (
+        f"{emoji} POSITION EXIT{urgency_label}\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"Type: {exit_type}\n"
+        f"Window: {window}\n"
+        f"Symbol: {symbol}\n"
+        f"Shares sold: {shares}\n"
+        f"Price: ${price:.2f}\n"
+        f"P/L: {pnl:+.1f}%\n\n"
+        f"Reason: {reason}\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+    )
+    return _send_message(text, parse_mode="")
+
+
+def send_morning_summary(data: dict) -> bool:
+    """Send morning check summary: gap %, position state, stop levels, actions taken."""
+    actions = data.get("actions", [])
+    positions = data.get("positions", [])
+    action_count = len(actions)
+
+    text = (
+        f"\U0001f305 Morning Check Summary\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+    )
+
+    for pos in positions:
+        symbol = pos.get("symbol", "???")
+        shares = pos.get("shares", 0)
+        pnl = pos.get("pnl_pct", 0)
+        gap = pos.get("gap_pct", 0)
+        stop_level = pos.get("stop_level", 0)
+        text += (
+            f"{symbol}: {shares} shares (P/L: {pnl:+.1f}%)\n"
+            f"  Gap: {gap:+.1f}% | Stop: ${stop_level:.2f}\n"
+        )
+
+    if actions:
+        text += f"\nActions taken: {action_count}\n"
+        for a in actions:
+            text += f"  {a}\n"
+    else:
+        text += "\nNo actions taken\n"
+
+    text += f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+
+    return _send_message(text, parse_mode="")
+
+
 def send_backtest_summary(stats: dict, csv_path: str | None = None) -> bool:
     """Send backtest results summary and optionally the CSV file."""
     total_return = stats.get("total_return_pct", 0)

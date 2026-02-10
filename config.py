@@ -107,4 +107,21 @@ LEVERAGE_CONFIG = {
     "use_sqqq_trading": False,            # Enable SQQQ entries on k-NN SHORT signals
     "sqqq_min_knn_confidence": 0.60,      # Minimum k-NN confidence for SQQQ entry
     "sqqq_max_position_pct": 0.40,        # Max 40% of allocated capital in SQQQ
+
+    # Position Manager — windowed intraday management
+    "pm_enabled": True,
+    "pm_stop_loss_pct": 0.08,               # 8% hard stop from entry
+    "pm_trailing_stop_pct": 0.06,           # 6% trailing stop from high watermark
+    "pm_gap_down_exit_pct": 0.04,           # 4% overnight gap triggers exit
+    "pm_regime_emergency_pct": 0.03,        # 3% below SMA-250 triggers intraday exit
+    "pm_vol_spike_exit_pct": 0.50,          # 50% vol increase triggers exit
+    "pm_daily_loss_limit_pct": 0.05,        # 5% account drawdown triggers exit
+    "pm_max_hold_days_losing": 15,          # Max days to hold a losing position
+    "pm_min_day_trades_reserve": 2,         # Reserve 2 day trades for EOD
+    "pm_profit_taking_enabled": True,
+    "pm_profit_tiers": [
+        {"threshold_pct": 8.0, "sell_fraction": 0.25},
+        {"threshold_pct": 15.0, "sell_fraction": 0.25},
+        {"threshold_pct": 25.0, "sell_fraction": 0.25},
+    ],
 }

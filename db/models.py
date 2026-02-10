@@ -189,6 +189,33 @@ def init_tables(conn: sqlite3.Connection | None = None) -> None:
             pregame_notes TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS position_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            window TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            shares_before INTEGER,
+            shares_sold INTEGER,
+            shares_after INTEGER,
+            price REAL,
+            pnl_pct REAL,
+            order_id TEXT,
+            order_status TEXT,
+            trigger_value REAL,
+            trigger_detail TEXT,
+            profit_tier_pct REAL,
+            high_watermark REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS position_watermarks (
+            symbol TEXT PRIMARY KEY,
+            high_price REAL NOT NULL,
+            high_date TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS backtest_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT NOT NULL,
@@ -455,3 +482,74 @@ def get_today_pregame(conn: sqlite3.Connection | None = None) -> dict | None:
             [today_str],
         ).fetchone()
         return dict(row) if row else None
+
+
+# ── Position Manager helpers ──
+
+
+def save_position_event(data: dict, conn: sqlite3.Connection | None = None) -> int:
+    """Insert a position event record. Returns the row ID."""
+    with get_db(conn) as c:
+        columns = list(data.keys())
+        placeholders = ", ".join(["?"] * len(columns))
+        col_str = ", ".join(columns)
+        cursor = c.execute(
+            f"INSERT INTO position_events ({col_str}) VALUES ({placeholders})",
+            [data[col] for col in columns],
+        )
+        return cursor.lastrowid
+
+
+def update_position_event(event_id: int, updates: dict, conn: sqlite3.Connection | None = None) -> None:
+    """Update an existing position event record."""
+    with get_db(conn) as c:
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [event_id]
+        c.execute(
+            f"UPDATE position_events SET {set_clause} WHERE id = ?",
+            values,
+        )
+
+
+def get_today_position_events(symbol: str, conn: sqlite3.Connection | None = None) -> list[dict]:
+    """Get all position events for a symbol today."""
+    with get_db(conn) as c:
+        today_str = datetime.now(ET).date().isoformat()
+        rows = c.execute(
+            "SELECT * FROM position_events WHERE symbol = ? AND date = ? ORDER BY id",
+            [symbol, today_str],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_position_watermark(symbol: str, conn: sqlite3.Connection | None = None) -> dict | None:
+    """Get the high watermark for a symbol."""
+    with get_db(conn) as c:
+        row = c.execute(
+            "SELECT * FROM position_watermarks WHERE symbol = ?",
+            [symbol],
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def update_position_watermark(symbol: str, high_price: float, high_date: str, conn: sqlite3.Connection | None = None) -> None:
+    """Upsert the high watermark for a symbol."""
+    with get_db(conn) as c:
+        now_str = datetime.now(ET).isoformat()
+        c.execute(
+            "INSERT INTO position_watermarks (symbol, high_price, high_date, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(symbol) DO UPDATE SET high_price = ?, high_date = ?, updated_at = ?",
+            [symbol, high_price, high_date, now_str, high_price, high_date, now_str],
+        )
+
+
+def get_profit_tiers_taken(symbol: str, since_date: str, conn: sqlite3.Connection | None = None) -> list[float]:
+    """Get profit tier percentages already taken for a symbol since a date."""
+    with get_db(conn) as c:
+        rows = c.execute(
+            "SELECT profit_tier_pct FROM position_events "
+            "WHERE symbol = ? AND date >= ? AND event_type = 'PARTIAL_PROFIT' AND order_status = 'EXECUTED'",
+            [symbol, since_date],
+        ).fetchall()
+        return [r["profit_tier_pct"] for r in rows if r["profit_tier_pct"] is not None]

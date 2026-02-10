@@ -179,6 +179,52 @@ def mock_uw_flow_bearish():
     }
 
 
+@pytest.fixture
+def mock_tqqq_position_state():
+    """Default PositionState for TQQQ (holding, small profit)."""
+    from strategy.position_manager import PositionState
+    return PositionState(
+        symbol="TQQQ",
+        shares=200,
+        avg_entry_price=48.00,
+        current_price=50.64,
+        market_value=10128.0,
+        unrealized_pnl_pct=0.055,
+        entry_date="2025-01-10",
+        holding_days=5,
+        intraday_high=51.00,
+        intraday_low=49.80,
+        intraday_open=50.00,
+        prev_close=49.90,
+        overnight_gap_pct=0.002,
+        intraday_change_pct=0.0128,
+        intraday_drawdown_pct=0.007,
+    )
+
+
+@pytest.fixture
+def mock_sqqq_position_state():
+    """Default PositionState for SQQQ."""
+    from strategy.position_manager import PositionState
+    return PositionState(
+        symbol="SQQQ",
+        shares=150,
+        avg_entry_price=12.00,
+        current_price=12.50,
+        market_value=1875.0,
+        unrealized_pnl_pct=0.042,
+        entry_date="2025-01-12",
+        holding_days=3,
+        intraday_high=12.80,
+        intraday_low=12.20,
+        intraday_open=12.30,
+        prev_close=12.10,
+        overnight_gap_pct=0.0165,
+        intraday_change_pct=0.016,
+        intraday_drawdown_pct=0.023,
+    )
+
+
 # Fixture file paths
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 

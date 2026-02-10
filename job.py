@@ -5,6 +5,8 @@ CLI entry point for the leveraged ETF strategy.
 Usage:
     python job.py run               # Execute daily strategy
     python job.py run --halfday-check  # Only run if today is a half day
+    python job.py morning           # Morning position check (9:35 AM ET)
+    python job.py midday            # Midday position check (12:30 PM ET)
     python job.py pregame           # Pre-execution intel gathering (3:30 PM)
     python job.py status            # Show current state without trading
     python job.py backtest          # Run historical backtest
@@ -338,6 +340,114 @@ def _build_sqqq_sizing_data(signals: "StrategySignals") -> dict:
     }
 
 
+def cmd_morning():
+    """Morning position check (9:35 AM ET). Exits only — no entries."""
+    from strategy.position_manager import PositionManager
+    from db.models import get_connection, init_tables
+    import alpaca_client
+    import notifications
+
+    logger.info(f"{'='*50}")
+    logger.info(f"Leveraged ETF Strategy - MORNING CHECK - {_timestamp()}")
+    logger.info(f"{'='*50}")
+
+    if not LEVERAGE_CONFIG.get("pm_enabled", True):
+        logger.info("Position manager disabled, skipping morning check")
+        return
+
+    conn = get_connection()
+    try:
+        init_tables(conn)
+
+        # Check market is open
+        today_str = datetime.now(ET).date().isoformat()
+        calendar = alpaca_client.get_calendar(today_str)
+        if calendar is None:
+            logger.info("Market closed today, skipping morning check")
+            return
+
+        pm = PositionManager(alpaca_client=alpaca_client, config=LEVERAGE_CONFIG)
+        decisions = pm.run_morning_check(conn)
+
+        if decisions:
+            actions = [f"{d.exit_type}: {d.reason}" for d in decisions if d.should_exit]
+            logger.info(f"Morning check: {len(actions)} actions taken")
+            for a in actions:
+                logger.info(f"  {a}")
+        else:
+            logger.info("Morning check: no actions needed")
+
+        # Print status dashboard
+        try:
+            positions = alpaca_client.get_positions()
+            managed = {LEVERAGE_CONFIG["bull_etf"], LEVERAGE_CONFIG["bear_etf"]}
+            pos_data = []
+            for p in positions:
+                if p["symbol"] in managed:
+                    snapshots = alpaca_client.get_snapshot([p["symbol"]])
+                    snap = snapshots.get(p["symbol"], {})
+                    prev_close = snap.get("prev_daily_bar_close", 0) or 0
+                    open_price = snap.get("daily_bar_open", 0) or 0
+                    gap_pct = ((open_price - prev_close) / prev_close * 100) if prev_close > 0 else 0
+                    stop_level = p["avg_entry_price"] * (1 - LEVERAGE_CONFIG.get("pm_stop_loss_pct", 0.08))
+                    pos_data.append({
+                        "symbol": p["symbol"],
+                        "shares": p["qty"],
+                        "pnl_pct": p["unrealized_plpc"] * 100,
+                        "gap_pct": gap_pct,
+                        "stop_level": stop_level,
+                    })
+            if pos_data:
+                notifications.send_morning_summary({
+                    "positions": pos_data,
+                    "actions": [f"{d.exit_type}: {d.reason}" for d in decisions if d.should_exit],
+                })
+        except Exception as e:
+            logger.warning(f"Failed to send morning summary: {e}")
+
+    finally:
+        conn.close()
+
+
+def cmd_midday():
+    """Midday position check (12:30 PM ET). Exits only — no entries."""
+    from strategy.position_manager import PositionManager
+    from db.models import get_connection, init_tables
+    import alpaca_client
+
+    logger.info(f"{'='*50}")
+    logger.info(f"Leveraged ETF Strategy - MIDDAY CHECK - {_timestamp()}")
+    logger.info(f"{'='*50}")
+
+    if not LEVERAGE_CONFIG.get("pm_enabled", True):
+        logger.info("Position manager disabled, skipping midday check")
+        return
+
+    conn = get_connection()
+    try:
+        init_tables(conn)
+
+        # Check market is open
+        today_str = datetime.now(ET).date().isoformat()
+        calendar = alpaca_client.get_calendar(today_str)
+        if calendar is None:
+            logger.info("Market closed today, skipping midday check")
+            return
+
+        pm = PositionManager(alpaca_client=alpaca_client, config=LEVERAGE_CONFIG)
+        decisions = pm.run_midday_check(conn)
+
+        if decisions:
+            actions = [f"{d.exit_type}: {d.reason}" for d in decisions if d.should_exit]
+            logger.info(f"Midday check: {len(actions)} actions taken")
+            for a in actions:
+                logger.info(f"  {a}")
+        else:
+            logger.info("Midday check: no actions needed")
+    finally:
+        conn.close()
+
+
 def cmd_pregame():
     """
     Pre-execution intelligence gathering. Runs at 3:30 PM EST.
@@ -591,6 +701,20 @@ def cmd_run(halfday_check: bool = False):
             logger.error(msg)
             notifications.send_error("Insufficient Data", msg)
             return
+
+        # Update high watermark if holding managed positions
+        if LEVERAGE_CONFIG.get("pm_enabled", True):
+            try:
+                from db.models import get_position_watermark, update_position_watermark
+                for sym in [LEVERAGE_CONFIG["bull_etf"], LEVERAGE_CONFIG["bear_etf"]]:
+                    pos = data.tqqq_position if sym == LEVERAGE_CONFIG["bull_etf"] else data.sqqq_position
+                    if pos and pos["qty"] > 0:
+                        price = pos["current_price"]
+                        wm = get_position_watermark(sym, conn)
+                        if wm is None or price > wm["high_price"]:
+                            update_position_watermark(sym, price, datetime.now(ET).date().isoformat(), conn)
+            except Exception as e:
+                logger.warning(f"Watermark update failed: {e}")
 
         # Compute signals
         signals = _compute_signals(data, conn=conn)
@@ -1370,8 +1494,10 @@ def cmd_force_exit():
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python job.py {run|pregame|status|backtest|force_exit}")
+        print("Usage: python job.py {run|morning|midday|pregame|status|backtest|force_exit}")
         print("  run [--halfday-check]  Execute daily strategy")
+        print("  morning                Morning position check (9:35 AM ET)")
+        print("  midday                 Midday position check (12:30 PM ET)")
         print("  pregame                Pre-execution intel gathering (3:30 PM)")
         print("  status                 Show current state (no trading)")
         print("  backtest               Run historical backtest")
@@ -1383,6 +1509,10 @@ def main():
     if command == "run":
         halfday = "--halfday-check" in sys.argv
         cmd_run(halfday_check=halfday)
+    elif command == "morning":
+        cmd_morning()
+    elif command == "midday":
+        cmd_midday()
     elif command == "pregame":
         cmd_pregame()
     elif command == "status":
