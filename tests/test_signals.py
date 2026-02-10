@@ -173,6 +173,45 @@ class TestOverextended:
         assert check_overextended(500, 0) is False
 
 
+class TestRSI:
+    def test_overbought(self):
+        """Monotonically rising closes → RSI near 100."""
+        closes = list(np.linspace(400, 550, 30))
+        from strategy.signals import calculate_rsi
+        rsi = calculate_rsi(closes)
+        assert rsi > 90
+
+    def test_oversold(self):
+        """Monotonically falling closes → RSI near 0."""
+        closes = list(np.linspace(550, 400, 30))
+        from strategy.signals import calculate_rsi
+        rsi = calculate_rsi(closes)
+        assert rsi < 10
+
+    def test_neutral(self):
+        """Mixed closes → RSI near 50."""
+        np.random.seed(42)
+        closes = [500 + np.random.normal(0, 5) for _ in range(30)]
+        from strategy.signals import calculate_rsi
+        rsi = calculate_rsi(closes)
+        assert 30 < rsi < 70
+
+    def test_insufficient_data(self):
+        """Too few closes → returns neutral 50."""
+        from strategy.signals import calculate_rsi
+        assert calculate_rsi([100, 101, 102]) == 50.0
+
+    def test_check_rsi_overbought(self):
+        """Overbought check with custom threshold."""
+        from strategy.signals import check_rsi_overbought
+        closes = list(np.linspace(400, 550, 30))
+        assert check_rsi_overbought(closes, threshold=70) is True
+        # Mixed data should not trigger overbought
+        np.random.seed(42)
+        mixed = [500 + np.random.normal(0, 5) for _ in range(30)]
+        assert check_rsi_overbought(mixed, threshold=70) is False
+
+
 class TestSideways:
     def test_sideways_market(self, sideways_closes):
         """Tight range over 30 days → sideways."""

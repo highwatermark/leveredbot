@@ -18,6 +18,7 @@ from strategy.signals import (
     check_consecutive_down_days,
     check_overextended,
     check_sideways,
+    check_rsi_overbought,
 )
 
 
@@ -50,15 +51,21 @@ def get_allocated_capital(
         max_portfolio_pct = LEVERAGE_CONFIG["max_portfolio_pct"]
 
     bull_etf = LEVERAGE_CONFIG["bull_etf"]
+    bear_etf = LEVERAGE_CONFIG["bear_etf"]
     other_value = 0.0
     tqqq_value = 0.0
+    sqqq_value = 0.0
 
     for pos in positions:
-        if pos["symbol"] == bull_etf:
+        sym = pos["symbol"]
+        if sym == bull_etf:
             tqqq_value = abs(pos.get("market_value", 0))
+        elif sym == bear_etf:
+            sqqq_value = abs(pos.get("market_value", 0))
         else:
             other_value += abs(pos.get("market_value", 0))
 
+    strategy_value = tqqq_value + sqqq_value
     max_allocation = equity * max_portfolio_pct
     available = min(max_allocation, equity - other_value)
     available = max(0, available)
@@ -67,8 +74,10 @@ def get_allocated_capital(
         "total_equity": equity,
         "other_positions_value": other_value,
         "tqqq_position_value": tqqq_value,
+        "sqqq_position_value": sqqq_value,
+        "strategy_position_value": strategy_value,
         "allocated_capital": available,
-        "cash_available": equity - other_value - tqqq_value,
+        "cash_available": equity - other_value - strategy_value,
     }
 
 
@@ -176,6 +185,18 @@ def run_gate_checklist(data: dict) -> tuple[bool, list[str]]:
     if trading_days < 250:
         failed.append("data_quality")
 
+    # Gate 15: RSI overbought
+    if check_rsi_overbought(closes):
+        failed.append("rsi_overbought")
+
+    # Gate 16: k-NN disagreement (regime bullish but k-NN predicts SHORT with high confidence)
+    if not LEVERAGE_CONFIG.get("knn_report_only", True):
+        knn_dir = data.get("knn_direction", "FLAT")
+        knn_conf = data.get("knn_confidence", 0.5)
+        disagree_threshold = LEVERAGE_CONFIG.get("knn_disagreement_confidence", 0.60)
+        if regime in ("STRONG_BULL", "BULL") and knn_dir == "SHORT" and knn_conf >= disagree_threshold:
+            failed.append("knn_disagreement")
+
     return (len(failed) == 0, failed)
 
 
@@ -265,6 +286,12 @@ def calculate_target_shares(data: dict) -> dict:
             target_pct = min(target_pct, LEVERAGE_CONFIG["min_position_pct"])
             limiting_factors.append("consecutive_down")
 
+        # Step 7: k-NN adjustment (if enabled and not report-only)
+        knn_adj = data.get("knn_adjustment", 1.0)
+        if not LEVERAGE_CONFIG.get("knn_report_only", True) and knn_adj < 1.0:
+            target_pct *= knn_adj
+            limiting_factors.append(f"knn_adj={knn_adj}")
+
         # Calculate target value and shares
         target_value = allocated * target_pct
         target_shares = max(0, int(target_value / tqqq_price)) if tqqq_price > 0 else 0
@@ -289,6 +316,147 @@ def calculate_target_shares(data: dict) -> dict:
         action = "HOLD"
 
     return {
+        "target_shares": target_shares,
+        "target_value": target_value,
+        "current_shares": current_shares,
+        "delta_shares": delta_shares,
+        "delta_value": delta_value,
+        "action": action,
+        "limiting_factors": limiting_factors,
+        "target_allocation_pct": round(target_pct, 4),
+    }
+
+
+def run_sqqq_gate_checklist(data: dict) -> tuple[bool, list[str]]:
+    """
+    Run the 9-gate SQQQ entry checklist. ALL gates must pass for SQQQ entry.
+
+    Args:
+        data: Dict with knn_direction, knn_confidence, vol_regime, allocated_capital,
+              is_execution_window, day_trades_remaining, trading_days_fetched,
+              has_tqqq_position, regime
+
+    Returns:
+        (all_passed: bool, list_of_failed_gate_names: list[str])
+    """
+    failed = []
+
+    # Gate S1: k-NN must predict SHORT
+    knn_dir = data.get("knn_direction", "FLAT")
+    if knn_dir != "SHORT":
+        failed.append("knn_not_short")
+
+    # Gate S2: k-NN confidence above SQQQ threshold
+    knn_conf = data.get("knn_confidence", 0.5)
+    min_conf = LEVERAGE_CONFIG.get("sqqq_min_knn_confidence", 0.60)
+    if knn_conf < min_conf:
+        failed.append("knn_confidence")
+
+    # Gate S3: Volatility not EXTREME
+    vol_regime = data.get("vol_regime", "NORMAL")
+    if vol_regime == "EXTREME":
+        failed.append("vol_extreme")
+
+    # Gate S4: Capital available
+    allocated = data.get("allocated_capital", 0)
+    if allocated < LEVERAGE_CONFIG["min_trade_value"]:
+        failed.append("capital")
+
+    # Gate S5: Execution window
+    if not data.get("is_execution_window", False):
+        failed.append("execution_window")
+
+    # Gate S6: PDT
+    day_trades = data.get("day_trades_remaining", 0)
+    if day_trades < LEVERAGE_CONFIG["min_day_trades_for_rebalance"]:
+        failed.append("pdt")
+
+    # Gate S7: Data quality
+    trading_days = data.get("trading_days_fetched", 0)
+    if trading_days < 250:
+        failed.append("data_quality")
+
+    # Gate S8: Mutual exclusivity — no TQQQ position
+    if data.get("has_tqqq_position", False):
+        failed.append("mutual_exclusivity")
+
+    # Gate S9: Not in RISK_OFF or BREAKDOWN regime
+    regime = data.get("regime", "RISK_OFF")
+    if regime in ("RISK_OFF", "BREAKDOWN"):
+        failed.append("regime_risk_off")
+
+    return (len(failed) == 0, failed)
+
+
+def calculate_sqqq_target_shares(data: dict) -> dict:
+    """
+    SQQQ position sizing — confidence-driven, simpler than TQQQ.
+
+    Steps:
+        1. Linear scale: 0.60 conf → 50% of max, 0.80+ → 100% of max
+        2. Vol adjustment (same as TQQQ)
+        3. Calculate shares from target_value / sqqq_price
+
+    Args:
+        data: Dict with knn_confidence, vol_regime, allocated_capital,
+              sqqq_price, current_shares
+
+    Returns:
+        Same dict shape as calculate_target_shares() + "symbol": "SQQQ"
+    """
+    knn_conf = data.get("knn_confidence", 0.5)
+    vol_regime = data.get("vol_regime", "NORMAL")
+    allocated = data.get("allocated_capital", 0)
+    sqqq_price = data.get("sqqq_price", 1)
+    current_shares = data.get("current_shares", 0)
+
+    max_pct = LEVERAGE_CONFIG.get("sqqq_max_position_pct", 0.40)
+    min_conf = LEVERAGE_CONFIG.get("sqqq_min_knn_confidence", 0.60)
+    limiting_factors = []
+
+    # Step 1: Confidence-driven sizing
+    # Linear: min_conf → 50% of max_pct, 0.80+ → 100% of max_pct
+    if knn_conf >= 0.80:
+        target_pct = max_pct
+    elif knn_conf >= min_conf:
+        scale = (knn_conf - min_conf) / (0.80 - min_conf)
+        target_pct = max_pct * (0.5 + 0.5 * scale)
+        limiting_factors.append(f"knn_conf={knn_conf:.2f}")
+    else:
+        target_pct = 0.0
+        limiting_factors.append(f"knn_conf_too_low={knn_conf:.2f}")
+
+    # Step 2: Vol adjustment
+    vol_adj = get_vol_adjustment(vol_regime)
+    if vol_adj < 1.0:
+        target_pct *= vol_adj
+        limiting_factors.append(f"vol={vol_regime}")
+
+    # Step 3: Calculate shares
+    target_value = allocated * target_pct
+    target_shares = max(0, int(target_value / sqqq_price)) if sqqq_price > 0 else 0
+    target_value = target_shares * sqqq_price
+
+    delta_shares = target_shares - current_shares
+    delta_value = delta_shares * sqqq_price
+
+    # Determine action
+    min_trade = LEVERAGE_CONFIG["min_trade_value"]
+    if target_shares == 0 and current_shares > 0:
+        action = "EXIT"
+    elif abs(delta_value) < min_trade:
+        action = "HOLD"
+        delta_shares = 0
+        delta_value = 0
+    elif delta_shares > 0:
+        action = "BUY"
+    elif delta_shares < 0:
+        action = "SELL"
+    else:
+        action = "HOLD"
+
+    return {
+        "symbol": "SQQQ",
         "target_shares": target_shares,
         "target_value": target_value,
         "current_shares": current_shares,

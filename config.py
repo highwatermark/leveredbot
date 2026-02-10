@@ -35,7 +35,7 @@ DB_PATH = DATA_DIR / "leveraged_etf.db"
 LEVERAGE_CONFIG = {
     # Instruments
     "bull_etf": "TQQQ",
-    "bear_etf": "SQQQ",  # reference only, NOT traded
+    "bear_etf": "SQQQ",  # traded when use_sqqq_trading=True
     "underlying": "QQQ",
 
     # Capital Allocation
@@ -46,7 +46,7 @@ LEVERAGE_CONFIG = {
     # Regime Detection (on QQQ)
     "sma_fast": 50,
     "sma_slow": 250,
-    "sma_deadzone_pct": 0.02,       # 2% band around SMA to prevent whipsaws
+    "sma_deadzone_pct": 0.05,       # 5% band around SMA to reduce whipsaws (was 2%)
 
     # Historical Data
     "history_calendar_days": 400,   # ~280 trading days, enough for 250-bar SMA
@@ -89,5 +89,22 @@ LEVERAGE_CONFIG = {
     "min_day_trades_for_rebalance": 2,
 
     # Regime oscillation protection
-    "min_regime_hold_days": 2,
+    "min_regime_hold_days": 10,       # Hold regime for 10 days before switching (was 2)
+
+    # Expansion Tier 1 toggles
+    "use_binary_mode": True,          # Eliminate CAUTIOUS regime (maps to BULL)
+    "rsi_overbought_threshold": 70,   # RSI-14 above this blocks new buys
+
+    # k-NN signal overlay
+    "use_knn_signal": True,           # Enable k-NN prediction
+    "knn_report_only": True,          # Report-only mode (no sizing impact)
+    "knn_neighbors": 7,               # k in k-NN
+    "knn_min_confidence": 0.55,       # Below this → FLAT signal
+    "knn_disagreement_confidence": 0.60,  # k-NN SHORT + regime BULL at this confidence → gate blocks
+    "knn_model_path": "data/knn_model.pkl",
+
+    # SQQQ (inverse) trading
+    "use_sqqq_trading": False,            # Enable SQQQ entries on k-NN SHORT signals
+    "sqqq_min_knn_confidence": 0.60,      # Minimum k-NN confidence for SQQQ entry
+    "sqqq_max_position_pct": 0.40,        # Max 40% of allocated capital in SQQQ
 }

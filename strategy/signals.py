@@ -125,6 +125,51 @@ def check_options_flow(uw_flow_data: dict) -> tuple[bool, float]:
     return uw_flow_data.get("is_bearish", False), uw_flow_data.get("adjustment_factor", 1.0)
 
 
+def calculate_rsi(closes: list[float], period: int = 14) -> float:
+    """
+    Calculate RSI (Relative Strength Index) from closing prices.
+
+    Uses the standard Wilder smoothing method (exponential moving average of
+    gains and losses).
+
+    Args:
+        closes: List of closing prices (needs at least period + 1 values)
+        period: RSI lookback period (default 14)
+
+    Returns:
+        RSI value between 0 and 100. Returns 50.0 (neutral) if insufficient data.
+    """
+    if len(closes) < period + 1:
+        return 50.0
+
+    deltas = np.diff(closes[-(period + 1):])
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+
+    avg_gain = float(np.mean(gains))
+    avg_loss = float(np.mean(losses))
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100.0 - (100.0 / (1.0 + rs)), 2)
+
+
+def check_rsi_overbought(
+    closes: list[float],
+    threshold: float | None = None,
+    period: int = 14,
+) -> bool:
+    """
+    Check if RSI is above the overbought threshold.
+
+    Returns True if RSI >= threshold (meaning we should not buy).
+    """
+    if threshold is None:
+        threshold = LEVERAGE_CONFIG.get("rsi_overbought_threshold", 70)
+    return calculate_rsi(closes, period) >= threshold
+
+
 def check_consecutive_down_days(closes: list[float], max_days: int | None = None) -> bool:
     """
     Check if QQQ has had too many consecutive down days.

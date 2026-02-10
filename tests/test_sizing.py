@@ -45,10 +45,10 @@ class TestAllocatedCapital:
 
 class TestGateChecklist:
     def _make_gate_data(self, **overrides):
-        """Create default gate data that passes all gates."""
-        np.random.seed(42)
-        # Use enough slope so last 30 days have >5% range (not sideways)
-        closes = [400 + i * 1.0 + np.random.normal(0, 3) for i in range(300)]
+        """Create default gate data that passes all gates (incl. RSI overbought)."""
+        np.random.seed(123)
+        # Slope + noise tuned to pass both sideways (>5% range) and RSI (<70)
+        closes = [400 + i * 0.7 + np.random.normal(0, 5) for i in range(300)]
 
         data = {
             "regime": "STRONG_BULL",
@@ -145,6 +145,14 @@ class TestGateChecklist:
         data = self._make_gate_data(holding_days_losing=20)
         passed, failed = run_gate_checklist(data)
         assert "holding_days" in failed
+
+    def test_gate_rsi_overbought_fail(self):
+        """RSI above threshold blocks entry."""
+        # Monotonically rising closes → RSI near 100
+        closes = list(np.linspace(400, 550, 300))
+        data = self._make_gate_data(qqq_closes=closes)
+        passed, failed = run_gate_checklist(data)
+        assert "rsi_overbought" in failed
 
     def test_multiple_gates_fail(self):
         data = self._make_gate_data(regime="RISK_OFF", momentum_score=0.1, realized_vol=40)

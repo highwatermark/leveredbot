@@ -33,9 +33,12 @@ def _ensure_cache_table(conn: sqlite3.Connection) -> None:
 
 
 def get_cached_bars(
-    symbol: str, days: int, conn: sqlite3.Connection | None = None
+    symbol: str,
+    days: int,
+    conn: sqlite3.Connection | None = None,
+    start_date: str | None = None,
 ) -> list[dict]:
-    """Read cached bars for a symbol, most recent N days."""
+    """Read cached bars for a symbol. Uses date filter when provided, else most recent N days."""
     close_after = False
     if conn is None:
         conn = get_connection()
@@ -43,16 +46,22 @@ def get_cached_bars(
 
     _ensure_cache_table(conn)
 
-    rows = conn.execute(
-        "SELECT * FROM bar_cache WHERE symbol = ? ORDER BY date DESC LIMIT ?",
-        [symbol, days],
-    ).fetchall()
+    if start_date:
+        rows = conn.execute(
+            "SELECT * FROM bar_cache WHERE symbol = ? AND date >= ? ORDER BY date ASC",
+            [symbol, start_date],
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM bar_cache WHERE symbol = ? ORDER BY date DESC LIMIT ?",
+            [symbol, days],
+        ).fetchall()
+        rows = list(reversed(rows))
 
     if close_after:
         conn.close()
 
-    # Return in chronological order
-    return [dict(r) for r in reversed(rows)]
+    return [dict(r) for r in rows]
 
 
 def get_cached_date_range(
@@ -154,12 +163,10 @@ def get_bars_with_cache(
             old_bars = fetch_fn(symbol, start_date.isoformat(), (min_date - timedelta(days=1)).isoformat())
             update_cache(symbol, old_bars, conn)
 
-    # Now read from cache
-    result = get_cached_bars(symbol, days * 2, conn)  # Over-fetch to ensure enough
+    # Read from cache with SQL date filter
+    result = get_cached_bars(symbol, days, conn, start_date=start_date.isoformat())
 
     if close_after:
         conn.close()
 
-    # Filter to requested range
-    start_str = start_date.isoformat()
-    return [b for b in result if b["date"] >= start_str]
+    return result

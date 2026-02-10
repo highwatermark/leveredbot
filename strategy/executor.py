@@ -19,6 +19,7 @@ def execute_rebalance(
     alpaca_client,
     is_emergency: bool = False,
     day_trades_remaining: int = 99,
+    symbol: str | None = None,
 ) -> dict:
     """
     Execute a rebalance order.
@@ -80,10 +81,11 @@ def execute_rebalance(
 
     side = "buy" if delta > 0 else "sell"
     qty = abs(delta)
+    trade_symbol = symbol or LEVERAGE_CONFIG["bull_etf"]
 
     try:
         order = alpaca_client.submit_market_order(
-            LEVERAGE_CONFIG["bull_etf"], qty, side
+            trade_symbol, qty, side
         )
         return {
             "executed": True,
@@ -105,9 +107,13 @@ def execute_rebalance(
         }
 
 
-def force_exit(alpaca_client) -> dict:
+def force_exit(alpaca_client, symbol: str | None = None) -> dict:
     """
-    Emergency sell all TQQQ immediately. Always executes regardless of PDT.
+    Emergency sell all shares of a symbol immediately. Always executes regardless of PDT.
+
+    Args:
+        alpaca_client: Module with get_positions/submit_market_order
+        symbol: Symbol to exit (default: bull_etf/TQQQ)
 
     Returns:
         {
@@ -117,25 +123,33 @@ def force_exit(alpaca_client) -> dict:
             "reason": str,
         }
     """
-    position = alpaca_client.get_tqqq_position()
+    target_symbol = symbol or LEVERAGE_CONFIG["bull_etf"]
+
+    # Find position by symbol
+    position = None
+    for p in alpaca_client.get_positions():
+        if p["symbol"] == target_symbol:
+            position = p
+            break
+
     if not position:
         return {
             "executed": False,
             "shares_sold": 0,
             "order": None,
-            "reason": "No TQQQ position to exit",
+            "reason": f"No {target_symbol} position to exit",
         }
 
     qty = position["qty"]
     try:
         order = alpaca_client.submit_market_order(
-            LEVERAGE_CONFIG["bull_etf"], qty, "sell"
+            target_symbol, qty, "sell"
         )
         return {
             "executed": True,
             "shares_sold": qty,
             "order": order,
-            "reason": f"Force sold {qty} shares TQQQ",
+            "reason": f"Force sold {qty} shares {target_symbol}",
         }
     except Exception as e:
         logger.error(f"Force exit failed: {e}")

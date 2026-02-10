@@ -85,11 +85,25 @@ class TestExecuteRebalance:
         assert result["action"] == "ERROR"
         assert "rejected" in result["reason"].lower()
 
+    def test_symbol_parameter_routes_sqqq(self):
+        """symbol='SQQQ' routes order to SQQQ instead of TQQQ."""
+        client = self._mock_client()
+        result = execute_rebalance(100, 0, 12.50, client, symbol="SQQQ")
+        assert result["executed"] is True
+        client.submit_market_order.assert_called_once_with("SQQQ", 100, "buy")
+
+    def test_default_symbol_is_tqqq(self):
+        """No symbol arg → defaults to TQQQ."""
+        client = self._mock_client()
+        result = execute_rebalance(200, 100, 50.0, client)
+        assert result["executed"] is True
+        client.submit_market_order.assert_called_once_with("TQQQ", 100, "buy")
+
 
 class TestForceExit:
     def test_force_exit_with_position(self):
         client = MagicMock()
-        client.get_tqqq_position.return_value = {"qty": 300, "market_value": 15000}
+        client.get_positions.return_value = [{"symbol": "TQQQ", "qty": 300, "market_value": 15000}]
         client.submit_market_order.return_value = {
             "order_id": "exit-456",
             "status": "accepted",
@@ -106,15 +120,44 @@ class TestForceExit:
 
     def test_force_exit_no_position(self):
         client = MagicMock()
-        client.get_tqqq_position.return_value = None
+        client.get_positions.return_value = []
         result = force_exit(client)
         assert result["executed"] is False
         assert "No TQQQ" in result["reason"]
 
     def test_force_exit_api_error(self):
         client = MagicMock()
-        client.get_tqqq_position.return_value = {"qty": 200, "market_value": 10000}
+        client.get_positions.return_value = [{"symbol": "TQQQ", "qty": 200, "market_value": 10000}]
         client.submit_market_order.side_effect = Exception("API timeout")
         result = force_exit(client)
         assert result["executed"] is False
         assert "failed" in result["reason"].lower()
+
+    def test_force_exit_sqqq(self):
+        """force_exit with symbol='SQQQ' exits SQQQ position."""
+        client = MagicMock()
+        client.get_positions.return_value = [
+            {"symbol": "TQQQ", "qty": 100, "market_value": 5000},
+            {"symbol": "SQQQ", "qty": 200, "market_value": 2500},
+        ]
+        client.submit_market_order.return_value = {
+            "order_id": "exit-sqqq",
+            "status": "accepted",
+            "symbol": "SQQQ",
+            "qty": 200,
+            "side": "sell",
+            "filled_avg_price": None,
+            "filled_qty": 0,
+        }
+        result = force_exit(client, symbol="SQQQ")
+        assert result["executed"] is True
+        assert result["shares_sold"] == 200
+        client.submit_market_order.assert_called_once_with("SQQQ", 200, "sell")
+
+    def test_force_exit_sqqq_no_position(self):
+        """force_exit SQQQ when no SQQQ position."""
+        client = MagicMock()
+        client.get_positions.return_value = [{"symbol": "TQQQ", "qty": 100, "market_value": 5000}]
+        result = force_exit(client, symbol="SQQQ")
+        assert result["executed"] is False
+        assert "No SQQQ" in result["reason"]

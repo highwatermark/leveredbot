@@ -132,6 +132,30 @@ def send_daily_report(data: dict) -> bool:
         f"P/L: {tqqq_pnl:+.1f}%\n"
     )
 
+    # SQQQ position (if held)
+    sqqq_shares = data.get("sqqq_current_shares", 0)
+    if sqqq_shares > 0:
+        sqqq_value = data.get("sqqq_position_value", 0)
+        sqqq_pnl = data.get("sqqq_pnl_pct", 0)
+        text += f"\nSQQQ Position: {sqqq_shares} shares (${sqqq_value:,.0f})\n"
+        text += f"SQQQ P/L: {sqqq_pnl:+.1f}%\n"
+
+    # SQQQ action (if taken)
+    sqqq_action = data.get("sqqq_action")
+    if sqqq_action and sqqq_action != "HOLD":
+        sqqq_order = data.get("sqqq_order_shares", 0)
+        side = "Buy" if sqqq_action == "BUY" else "Sell"
+        text += f"SQQQ Action: {side} {abs(sqqq_order)} shares\n"
+
+    # k-NN signal overlay (report-only)
+    knn_dir = data.get("knn_direction", "FLAT")
+    if knn_dir != "FLAT":
+        knn_conf = data.get("knn_confidence", 0.5)
+        knn_emoji = "\U0001f7e2" if knn_dir == "LONG" else "\U0001f534"
+        text += f"\nk-NN Signal: {knn_emoji} {knn_dir} ({knn_conf:.0%} conf)\n"
+    else:
+        text += f"\nk-NN Signal: \u26aa FLAT (low conviction)\n"
+
     # Pregame intel if available
     if data.get("pregame_sentiment"):
         text += (
@@ -201,6 +225,7 @@ def send_backtest_summary(stats: dict, csv_path: str | None = None) -> bool:
     total_days = stats.get("total_days", 0)
     start_date = stats.get("start_date", "?")
     end_date = stats.get("end_date", "?")
+    market_pct = f" ({days_in_market/total_days*100:.0f}%)" if total_days > 0 else ""
 
     text = (
         f"\U0001f4c8 Backtest Results ({start_date} to {end_date})\n"
@@ -208,7 +233,7 @@ def send_backtest_summary(stats: dict, csv_path: str | None = None) -> bool:
         f"Strategy Return: {total_return:+.1f}%\n"
         f"Max Drawdown: {max_dd:.1f}%\n"
         f"Trades: {num_trades}\n"
-        f"Days in Market: {days_in_market}/{total_days} ({days_in_market/total_days*100:.0f}%)\n\n"
+        f"Days in Market: {days_in_market}/{total_days}{market_pct}\n\n"
         f"Benchmarks:\n"
         f"  QQQ Buy & Hold: {qqq_return:+.1f}%\n"
         f"  TQQQ Buy & Hold: {tqqq_return:+.1f}%\n"

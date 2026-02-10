@@ -12,6 +12,7 @@ import time
 import logging
 from datetime import datetime, date, timedelta
 
+import httpx
 import pytz
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetCalendarRequest
@@ -29,22 +30,44 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 RETRY_DELAY = 30
 
+RETRYABLE_EXCEPTIONS = (
+    ConnectionError,
+    TimeoutError,
+    httpx.ConnectError,
+    httpx.ReadTimeout,
+    httpx.ConnectTimeout,
+    httpx.HTTPStatusError,
+)
+
+_trading_client: TradingClient | None = None
+_data_client: StockHistoricalDataClient | None = None
+
 
 def _get_trading_client() -> TradingClient:
-    return TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+    global _trading_client
+    if _trading_client is None:
+        _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+    return _trading_client
 
 
 def _get_data_client() -> StockHistoricalDataClient:
-    return StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    global _data_client
+    if _data_client is None:
+        _data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    return _data_client
 
 
 def _retry(fn, description: str = "API call"):
-    """Retry a function up to MAX_RETRIES times with RETRY_DELAY between attempts."""
+    """Retry a function up to MAX_RETRIES times on retryable errors only.
+
+    Retryable: ConnectionError, TimeoutError, httpx transport/status errors.
+    Non-retryable (ValueError, TypeError, auth errors, etc.) propagate immediately.
+    """
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             return fn()
-        except Exception as e:
+        except RETRYABLE_EXCEPTIONS as e:
             last_error = e
             logger.warning(f"{description} attempt {attempt}/{MAX_RETRIES} failed: {e}")
             if attempt < MAX_RETRIES:

@@ -219,3 +219,81 @@ class TestBacktestAssertions:
 
         result = _simulate_backtest(qqq, tqqq, dates)
         assert result["final_value"] > 100000, "Should have positive returns in bull"
+
+
+class TestCmdBacktestIntegration:
+    """Test the actual cmd_backtest() code path with mocked Alpaca data."""
+
+    def _make_bars(self, closes, start_date="2023-06-01"):
+        """Convert closes to bar dicts with sequential dates."""
+        from datetime import date, timedelta
+        start = date.fromisoformat(start_date)
+        bars = []
+        for i, close in enumerate(closes):
+            d = start + timedelta(days=i * 7 // 5)
+            bars.append({
+                "date": d.isoformat(),
+                "open": close * 0.999,
+                "high": close * 1.002,
+                "low": close * 0.998,
+                "close": close,
+                "volume": 45_000_000,
+            })
+        return bars
+
+    def test_cmd_backtest_writes_to_db(self, tmp_path):
+        """cmd_backtest() should write results to backtest_results table."""
+        import sqlite3
+        from unittest.mock import patch
+        from db.models import init_tables, get_connection
+
+        np.random.seed(42)
+        qqq = [450.0]
+        tqqq = [60.0]
+        for _ in range(350):
+            qqq.append(qqq[-1] * (1 + np.random.normal(0.001, 0.008)))
+            tqqq.append(tqqq[-1] * (1 + np.random.normal(0.003, 0.024)))
+
+        qqq_bars = self._make_bars(qqq)
+        tqqq_bars = self._make_bars(tqqq)
+
+        db_path = tmp_path / "backtest_test.db"
+
+        def db_factory():
+            c = sqlite3.connect(str(db_path))
+            c.row_factory = sqlite3.Row
+            c.execute("PRAGMA journal_mode=WAL")
+            return c
+
+        # Initialize DB
+        conn = db_factory()
+        init_tables(conn)
+        conn.commit()
+        conn.close()
+
+        with patch("db.models.get_connection", side_effect=db_factory), \
+             patch("db.cache.get_bars_with_cache", side_effect=[qqq_bars, tqqq_bars]), \
+             patch("notifications._send_message", return_value=True), \
+             patch("notifications._send_document", return_value=True), \
+             patch("config.DATA_DIR", tmp_path):
+
+            import job
+            stats = job.cmd_backtest()
+
+        assert stats is not None, "cmd_backtest should return stats"
+        assert "total_return_pct" in stats
+        assert "max_drawdown_pct" in stats
+        assert stats["num_trades"] > 0, "Should have executed some trades"
+        assert stats["total_days"] > 0, "Should have simulated some days"
+
+        # Verify DB has backtest_results
+        conn = db_factory()
+        try:
+            row = conn.execute("SELECT COUNT(*) as cnt FROM backtest_results").fetchone()
+            assert row["cnt"] > 0, "backtest_results table should have rows"
+        finally:
+            conn.close()
+
+        # Verify CSV was written
+        csv_path = tmp_path / "backtest_results.csv"
+        assert csv_path.exists(), "Backtest CSV should be written"

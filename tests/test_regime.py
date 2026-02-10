@@ -24,15 +24,20 @@ class TestDetectRegime:
         assert result == "BULL"
 
     def test_cautious_near_sma50(self):
-        """Price above 250-SMA but within deadzone of 50-SMA."""
+        """Price above 250-SMA but within deadzone of 50-SMA (binary_mode=False)."""
         # QQQ at 505, SMA50 at 500 (1% above, within 2% deadzone), SMA250 at 480
-        result = detect_regime(qqq_close=505, sma_50=500, sma_250=480, deadzone_pct=0.02)
+        result = detect_regime(qqq_close=505, sma_50=500, sma_250=480, deadzone_pct=0.02, binary_mode=False)
         assert result == "CAUTIOUS"
 
     def test_cautious_below_sma50(self):
-        """Price below 50-SMA but above 250-SMA."""
-        result = detect_regime(qqq_close=490, sma_50=500, sma_250=480, deadzone_pct=0.02)
+        """Price below 50-SMA but above 250-SMA (binary_mode=False)."""
+        result = detect_regime(qqq_close=490, sma_50=500, sma_250=480, deadzone_pct=0.02, binary_mode=False)
         assert result == "CAUTIOUS"
+
+    def test_binary_mode_maps_cautious_to_bull(self):
+        """In binary mode, CAUTIOUS scenarios return BULL instead."""
+        result = detect_regime(qqq_close=490, sma_50=500, sma_250=480, deadzone_pct=0.02, binary_mode=True)
+        assert result == "BULL"
 
     def test_risk_off(self):
         """Price below 250-SMA - deadzone."""
@@ -48,15 +53,13 @@ class TestDetectRegime:
     def test_deadzone_below_sma250(self):
         """Price in deadzone below 250-SMA (but not below lower band)."""
         # SMA250=500, lower band=490, price=495 (in deadzone)
-        result = detect_regime(qqq_close=495, sma_50=510, sma_250=500, deadzone_pct=0.02)
+        result = detect_regime(qqq_close=495, sma_50=510, sma_250=500, deadzone_pct=0.02, binary_mode=False)
         assert result == "CAUTIOUS"
 
     def test_exact_at_sma50_deadzone(self):
-        """Price exactly at 50-SMA + deadzone threshold."""
-        sma_50 = 500
-        deadzone = 0.02
+        """Price exactly at 50-SMA + deadzone threshold (binary_mode=False)."""
         # Exactly at the threshold
-        result = detect_regime(qqq_close=500 * 1.02, sma_50=500, sma_250=480, deadzone_pct=0.02)
+        result = detect_regime(qqq_close=500 * 1.02, sma_50=500, sma_250=480, deadzone_pct=0.02, binary_mode=False)
         # At boundary, not strictly above
         assert result == "CAUTIOUS"
 

@@ -30,6 +30,7 @@ def detect_regime(
     sma_50: float,
     sma_250: float,
     deadzone_pct: float | None = None,
+    binary_mode: bool | None = None,
 ) -> str:
     """
     Determine the raw regime state based on QQQ price vs SMAs.
@@ -39,12 +40,16 @@ def detect_regime(
         sma_50: 50-day simple moving average of QQQ
         sma_250: 250-day simple moving average of QQQ
         deadzone_pct: Band around SMA to prevent whipsaws (default from config)
+        binary_mode: If True, CAUTIOUS maps to BULL (default from config)
 
     Returns:
         One of: STRONG_BULL, BULL, CAUTIOUS, RISK_OFF, BREAKDOWN
+        (CAUTIOUS only returned when binary_mode is False)
     """
     if deadzone_pct is None:
         deadzone_pct = LEVERAGE_CONFIG["sma_deadzone_pct"]
+    if binary_mode is None:
+        binary_mode = LEVERAGE_CONFIG.get("use_binary_mode", False)
 
     sma_50_upper = sma_50 * (1 + deadzone_pct)
     sma_250_upper = sma_250 * (1 + deadzone_pct)
@@ -67,12 +72,15 @@ def detect_regime(
         return "BULL"
 
     # CAUTIOUS: above 250-SMA but near or below 50-SMA
+    # In binary mode, this maps to BULL to avoid 25% partial positions
+    cautious = "BULL" if binary_mode else "CAUTIOUS"
+
     if qqq_close > sma_250:
-        return "CAUTIOUS"
+        return cautious
 
     # Between sma_250_lower and sma_250 — in the deadzone below 250-SMA
-    # Treat as CAUTIOUS (don't flip to RISK_OFF in the deadzone)
-    return "CAUTIOUS"
+    # Treat as CAUTIOUS/BULL (don't flip to RISK_OFF in the deadzone)
+    return cautious
 
 
 def get_effective_regime(

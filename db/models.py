@@ -9,6 +9,7 @@ Uses raw SQL with sqlite3 for simplicity. Three tables:
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, date
 from pathlib import Path
 
@@ -29,14 +30,27 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def get_db(conn: sqlite3.Connection | None = None):
+    """Context manager for DB connections. Commits on success, closes if we opened it."""
+    should_close = conn is None
+    if should_close:
+        conn = get_connection()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        if should_close:
+            conn.close()
+
+
 def init_tables(conn: sqlite3.Connection | None = None) -> None:
     """Create all tables if they don't exist."""
-    close_after = False
-    if conn is None:
-        conn = get_connection()
-        close_after = True
-
-    conn.executescript("""
+    with get_db(conn) as c:
+        c.executescript("""
         CREATE TABLE IF NOT EXISTS decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT NOT NULL,
@@ -91,7 +105,17 @@ def init_tables(conn: sqlite3.Connection | None = None) -> None:
             day_trades_remaining INTEGER,
 
             trading_days_fetched INTEGER,
-            is_half_day INTEGER DEFAULT 0
+            is_half_day INTEGER DEFAULT 0,
+
+            knn_direction TEXT DEFAULT 'FLAT',
+            knn_confidence REAL DEFAULT 0.5,
+            knn_adjustment REAL DEFAULT 1.0,
+
+            symbol TEXT DEFAULT 'TQQQ',
+            sqqq_position_value REAL DEFAULT 0,
+            sqqq_pnl_pct REAL DEFAULT 0,
+
+            status TEXT DEFAULT 'COMPLETE'
         );
 
         CREATE TABLE IF NOT EXISTS regimes (
@@ -119,7 +143,10 @@ def init_tables(conn: sqlite3.Connection | None = None) -> None:
             allocated_capital REAL,
             realized_vol REAL,
             benchmark_qqq_pct REAL,
-            strategy_total_return_pct REAL
+            strategy_total_return_pct REAL,
+            sqqq_shares INTEGER DEFAULT 0,
+            sqqq_position_value REAL DEFAULT 0,
+            sqqq_pnl_pct REAL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS pregame (
@@ -179,242 +206,252 @@ def init_tables(conn: sqlite3.Connection | None = None) -> None:
             tqqq_buy_hold_pct REAL
         );
     """)
-    conn.commit()
+        # Migration: add status column for existing databases
+        try:
+            c.execute("SELECT status FROM decisions LIMIT 0")
+        except sqlite3.OperationalError:
+            c.execute("ALTER TABLE decisions ADD COLUMN status TEXT DEFAULT 'COMPLETE'")
 
-    if close_after:
-        conn.close()
+        # Migration: add k-NN columns for existing databases
+        for col, default in [
+            ("knn_direction", "'FLAT'"),
+            ("knn_confidence", "0.5"),
+            ("knn_adjustment", "1.0"),
+        ]:
+            try:
+                c.execute(f"SELECT {col} FROM decisions LIMIT 0")
+            except sqlite3.OperationalError:
+                c.execute(f"ALTER TABLE decisions ADD COLUMN {col} TEXT DEFAULT {default}"
+                          if col == "knn_direction" else
+                          f"ALTER TABLE decisions ADD COLUMN {col} REAL DEFAULT {default}")
+
+        # Migration: add SQQQ columns for existing databases
+        for table, cols in [
+            ("decisions", [
+                ("symbol", "TEXT", "'TQQQ'"),
+                ("sqqq_position_value", "REAL", "0"),
+                ("sqqq_pnl_pct", "REAL", "0"),
+            ]),
+            ("performance", [
+                ("sqqq_shares", "INTEGER", "0"),
+                ("sqqq_position_value", "REAL", "0"),
+                ("sqqq_pnl_pct", "REAL", "0"),
+            ]),
+        ]:
+            for col, col_type, default in cols:
+                try:
+                    c.execute(f"SELECT {col} FROM {table} LIMIT 0")
+                except sqlite3.OperationalError:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type} DEFAULT {default}")
 
 
-def log_daily_decision(data: dict, conn: sqlite3.Connection | None = None) -> None:
-    """Insert a daily decision record."""
-    close_after = False
-    if conn is None:
-        conn = get_connection()
-        close_after = True
+def log_daily_decision(data: dict, conn: sqlite3.Connection | None = None) -> int:
+    """Insert a daily decision record. Returns the row ID."""
+    with get_db(conn) as c:
+        # Ensure gates_failed is JSON string
+        if "gates_failed" in data and isinstance(data["gates_failed"], list):
+            data["gates_failed"] = json.dumps(data["gates_failed"])
 
-    # Ensure gates_failed is JSON string
-    if "gates_failed" in data and isinstance(data["gates_failed"], list):
-        data["gates_failed"] = json.dumps(data["gates_failed"])
+        columns = list(data.keys())
+        placeholders = ", ".join(["?"] * len(columns))
+        col_str = ", ".join(columns)
 
-    columns = list(data.keys())
-    placeholders = ", ".join(["?"] * len(columns))
-    col_str = ", ".join(columns)
+        cursor = c.execute(
+            f"INSERT INTO decisions ({col_str}) VALUES ({placeholders})",
+            [data[col] for col in columns],
+        )
+        return cursor.lastrowid
 
-    conn.execute(
-        f"INSERT INTO decisions ({col_str}) VALUES ({placeholders})",
-        [data[c] for c in columns],
-    )
-    conn.commit()
 
-    if close_after:
-        conn.close()
+def update_decision(decision_id: int, updates: dict, conn: sqlite3.Connection | None = None) -> None:
+    """Update an existing decision record (e.g., after trade execution)."""
+    with get_db(conn) as c:
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [decision_id]
+        c.execute(
+            f"UPDATE decisions SET {set_clause} WHERE id = ?",
+            values,
+        )
 
 
 def log_regime_change(
     old: str | None, new: str, data: dict, conn: sqlite3.Connection | None = None
 ) -> None:
     """Log a regime transition."""
-    close_after = False
-    if conn is None:
-        conn = get_connection()
-        close_after = True
-
-    conn.execute(
-        "INSERT INTO regimes (date, old_regime, new_regime, qqq_close, qqq_sma_50, qqq_sma_250, trigger_reason) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [
-            data.get("date", datetime.now(ET).date().isoformat()),
-            old,
-            new,
-            data.get("qqq_close"),
-            data.get("qqq_sma_50"),
-            data.get("qqq_sma_250"),
-            data.get("trigger_reason", ""),
-        ],
-    )
-    conn.commit()
-
-    if close_after:
-        conn.close()
+    with get_db(conn) as c:
+        c.execute(
+            "INSERT INTO regimes (date, old_regime, new_regime, qqq_close, qqq_sma_50, qqq_sma_250, trigger_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                data.get("date", datetime.now(ET).date().isoformat()),
+                old,
+                new,
+                data.get("qqq_close"),
+                data.get("qqq_sma_50"),
+                data.get("qqq_sma_250"),
+                data.get("trigger_reason", ""),
+            ],
+        )
 
 
 def log_daily_performance(data: dict, conn: sqlite3.Connection | None = None) -> None:
     """Insert a daily performance record."""
-    close_after = False
-    if conn is None:
-        conn = get_connection()
-        close_after = True
+    with get_db(conn) as c:
+        columns = list(data.keys())
+        placeholders = ", ".join(["?"] * len(columns))
+        col_str = ", ".join(columns)
 
-    columns = list(data.keys())
-    placeholders = ", ".join(["?"] * len(columns))
-    col_str = ", ".join(columns)
-
-    conn.execute(
-        f"INSERT INTO performance ({col_str}) VALUES ({placeholders})",
-        [data[c] for c in columns],
-    )
-    conn.commit()
-
-    if close_after:
-        conn.close()
+        c.execute(
+            f"INSERT INTO performance ({col_str}) VALUES ({placeholders})",
+            [data[col] for col in columns],
+        )
 
 
 def get_last_regime(conn: sqlite3.Connection | None = None) -> str | None:
     """Get the most recent regime from the decisions table."""
-    close_after = False
-    if conn is None:
-        conn = get_connection()
-        close_after = True
-
-    row = conn.execute(
-        "SELECT regime FROM decisions ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-
-    if close_after:
-        conn.close()
-
-    return row["regime"] if row else None
+    with get_db(conn) as c:
+        row = c.execute(
+            "SELECT regime FROM decisions ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return row["regime"] if row else None
 
 
 def get_regime_duration_days(conn: sqlite3.Connection | None = None) -> int:
     """How many days the current regime has been active."""
-    close_after = False
-    if conn is None:
-        conn = get_connection()
-        close_after = True
+    with get_db(conn) as c:
+        row = c.execute(
+            "SELECT date FROM regimes ORDER BY id DESC LIMIT 1"
+        ).fetchone()
 
-    row = conn.execute(
-        "SELECT date FROM regimes ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+        if not row:
+            return 999  # No regime changes recorded, treat as long-standing
 
-    if close_after:
-        conn.close()
-
-    if not row:
-        return 999  # No regime changes recorded, treat as long-standing
-
-    change_date = date.fromisoformat(row["date"])
-    return (datetime.now(ET).date() - change_date).days
+        change_date = date.fromisoformat(row["date"])
+        return (datetime.now(ET).date() - change_date).days
 
 
 def get_consecutive_losing_days(conn: sqlite3.Connection | None = None) -> int:
     """Count consecutive days where TQQQ position P&L was negative."""
-    close_after = False
-    if conn is None:
-        conn = get_connection()
-        close_after = True
+    with get_db(conn) as c:
+        rows = c.execute(
+            "SELECT tqqq_pnl_day FROM performance ORDER BY id DESC LIMIT 30"
+        ).fetchall()
 
-    rows = conn.execute(
-        "SELECT tqqq_pnl_day FROM performance ORDER BY id DESC LIMIT 30"
-    ).fetchall()
+        count = 0
+        for row in rows:
+            if row["tqqq_pnl_day"] is not None and row["tqqq_pnl_day"] < 0:
+                count += 1
+            else:
+                break
+        return count
 
-    if close_after:
-        conn.close()
 
-    count = 0
-    for row in rows:
-        if row["tqqq_pnl_day"] is not None and row["tqqq_pnl_day"] < 0:
-            count += 1
+def get_strategy_state(conn: sqlite3.Connection | None = None) -> dict:
+    """Get regime, duration, and losing days in a single DB pass.
+
+    Replaces 3 separate calls: get_last_regime, get_regime_duration_days,
+    get_consecutive_losing_days.
+    """
+    with get_db(conn) as c:
+        # Last regime from decisions
+        regime_row = c.execute(
+            "SELECT regime FROM decisions ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        last_regime = regime_row["regime"] if regime_row else None
+
+        # Duration from regimes
+        duration_row = c.execute(
+            "SELECT date FROM regimes ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if duration_row:
+            change_date = date.fromisoformat(duration_row["date"])
+            regime_duration = (datetime.now(ET).date() - change_date).days
         else:
-            break
-    return count
+            regime_duration = 999
+
+        # Consecutive losing days from performance
+        perf_rows = c.execute(
+            "SELECT tqqq_pnl_day FROM performance ORDER BY id DESC LIMIT 30"
+        ).fetchall()
+        losing_days = 0
+        for row in perf_rows:
+            if row["tqqq_pnl_day"] is not None and row["tqqq_pnl_day"] < 0:
+                losing_days += 1
+            else:
+                break
+
+        return {
+            "last_regime": last_regime,
+            "regime_duration_days": regime_duration,
+            "consecutive_losing_days": losing_days,
+        }
 
 
 def get_position_entry_date(conn: sqlite3.Connection | None = None) -> str | None:
     """Get the date when the current TQQQ position was opened."""
-    close_after = False
-    if conn is None:
-        conn = get_connection()
-        close_after = True
+    with get_db(conn) as c:
+        # Look for the most recent transition from 0 shares to >0 shares
+        rows = c.execute(
+            "SELECT date, current_shares FROM decisions ORDER BY id DESC LIMIT 60"
+        ).fetchall()
 
-    # Look for the most recent transition from 0 shares to >0 shares
-    rows = conn.execute(
-        "SELECT date, current_shares FROM decisions ORDER BY id DESC LIMIT 60"
-    ).fetchall()
+        if not rows:
+            return None
 
-    if close_after:
-        conn.close()
+        # Walk backwards to find when shares went from 0 to >0
+        entry_date = None
+        for row in rows:
+            shares = row["current_shares"] or 0
+            if shares > 0:
+                entry_date = row["date"]
+            else:
+                break
 
-    if not rows:
-        return None
-
-    # Walk backwards to find when shares went from 0 to >0
-    entry_date = None
-    for i, row in enumerate(rows):
-        shares = row["current_shares"] or 0
-        if shares > 0:
-            entry_date = row["date"]
-        else:
-            break
-
-    return entry_date
+        return entry_date
 
 
 def get_performance_summary(
     days: int = 30, conn: sqlite3.Connection | None = None
 ) -> dict:
     """Get aggregated performance stats over the last N days."""
-    close_after = False
-    if conn is None:
-        conn = get_connection()
-        close_after = True
+    with get_db(conn) as c:
+        rows = c.execute(
+            "SELECT * FROM performance ORDER BY id DESC LIMIT ?", [days]
+        ).fetchall()
 
-    rows = conn.execute(
-        "SELECT * FROM performance ORDER BY id DESC LIMIT ?", [days]
-    ).fetchall()
+        if not rows:
+            return {"days": 0, "total_pnl": 0, "avg_daily_pnl": 0, "best_day": 0, "worst_day": 0}
 
-    if close_after:
-        conn.close()
-
-    if not rows:
-        return {"days": 0, "total_pnl": 0, "avg_daily_pnl": 0, "best_day": 0, "worst_day": 0}
-
-    pnls = [r["tqqq_pnl_day"] or 0 for r in rows]
-    return {
-        "days": len(rows),
-        "total_pnl": sum(pnls),
-        "avg_daily_pnl": sum(pnls) / len(pnls),
-        "best_day": max(pnls),
-        "worst_day": min(pnls),
-        "latest_total_return_pct": rows[0]["strategy_total_return_pct"] or 0,
-    }
+        pnls = [r["tqqq_pnl_day"] or 0 for r in rows]
+        return {
+            "days": len(rows),
+            "total_pnl": sum(pnls),
+            "avg_daily_pnl": sum(pnls) / len(pnls),
+            "best_day": max(pnls),
+            "worst_day": min(pnls),
+            "latest_total_return_pct": rows[0]["strategy_total_return_pct"] or 0,
+        }
 
 
 def save_pregame(data: dict, conn: sqlite3.Connection | None = None) -> None:
     """Save pregame intelligence report."""
-    close_after = False
-    if conn is None:
-        conn = get_connection()
-        close_after = True
+    with get_db(conn) as c:
+        columns = list(data.keys())
+        placeholders = ", ".join(["?"] * len(columns))
+        col_str = ", ".join(columns)
 
-    columns = list(data.keys())
-    placeholders = ", ".join(["?"] * len(columns))
-    col_str = ", ".join(columns)
-
-    conn.execute(
-        f"INSERT INTO pregame ({col_str}) VALUES ({placeholders})",
-        [data[c] for c in columns],
-    )
-    conn.commit()
-
-    if close_after:
-        conn.close()
+        c.execute(
+            f"INSERT INTO pregame ({col_str}) VALUES ({placeholders})",
+            [data[col] for col in columns],
+        )
 
 
 def get_today_pregame(conn: sqlite3.Connection | None = None) -> dict | None:
     """Get today's pregame report if it exists."""
-    close_after = False
-    if conn is None:
-        conn = get_connection()
-        close_after = True
-
-    today_str = datetime.now(ET).date().isoformat()
-    row = conn.execute(
-        "SELECT * FROM pregame WHERE date = ? ORDER BY id DESC LIMIT 1",
-        [today_str],
-    ).fetchone()
-
-    if close_after:
-        conn.close()
-
-    return dict(row) if row else None
+    with get_db(conn) as c:
+        today_str = datetime.now(ET).date().isoformat()
+        row = c.execute(
+            "SELECT * FROM pregame WHERE date = ? ORDER BY id DESC LIMIT 1",
+            [today_str],
+        ).fetchone()
+        return dict(row) if row else None
