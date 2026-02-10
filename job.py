@@ -19,15 +19,18 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytz
 
 from config import LEVERAGE_CONFIG, DATA_DIR, LOG_DIR
 
-# Configure logging
+ET = pytz.timezone("America/New_York")
+
+# Configure logging — write to file directly; cron captures stdout separately
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.StreamHandler(),
         logging.FileHandler(LOG_DIR / "leveraged_etf.log"),
     ],
 )
@@ -35,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 def _timestamp() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def _fetch_all_data(use_cache: bool = True) -> dict:
@@ -55,7 +58,7 @@ def _fetch_all_data(use_cache: bool = True) -> dict:
             tqqq_pos = p
 
     # Calendar (half-day detection)
-    today_str = date.today().isoformat()
+    today_str = datetime.now(ET).date().isoformat()
     calendar = alpaca_client.get_calendar(today_str)
     is_half_day = calendar.get("is_half_day", False) if calendar else False
 
@@ -78,8 +81,8 @@ def _fetch_all_data(use_cache: bool = True) -> dict:
         )
         conn.close()
     else:
-        start = (date.today() - timedelta(days=cal_days)).isoformat()
-        end = date.today().isoformat()
+        start = (datetime.now(ET).date() - timedelta(days=cal_days)).isoformat()
+        end = datetime.now(ET).date().isoformat()
         qqq_bars = alpaca_client.get_bars(LEVERAGE_CONFIG["underlying"], start, end)
 
     qqq_closes = [b["close"] for b in qqq_bars]
@@ -226,7 +229,7 @@ def cmd_pregame():
     init_tables()
 
     # Check market is open
-    today_str = date.today().isoformat()
+    today_str = datetime.now(ET).date().isoformat()
     calendar = alpaca_client.get_calendar(today_str)
     if calendar is None:
         logger.info("Market closed today, skipping pregame")
@@ -393,6 +396,21 @@ def cmd_pregame():
     logger.info(f"Notes: {'; '.join(notes) if notes else 'None'}")
 
 
+def _already_traded_today() -> bool:
+    """Check if we already executed a trade today (prevents double-buy from halfday + main run)."""
+    from db.models import get_connection
+    today_str = datetime.now(ET).date().isoformat()
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM decisions WHERE date = ? AND order_action IN ('BUY', 'SELL')",
+            [today_str],
+        ).fetchone()
+        return row["cnt"] > 0 if row else False
+    finally:
+        conn.close()
+
+
 def cmd_run(halfday_check: bool = False):
     """Execute the daily strategy pipeline."""
     from strategy.sizing import run_gate_checklist, calculate_target_shares
@@ -493,6 +511,11 @@ def cmd_run(halfday_check: bool = False):
     is_emergency = signals["effective_regime"] in ("RISK_OFF", "BREAKDOWN")
     should_trade = gates_passed or is_emergency
 
+    # Dedup: skip if we already traded today (prevents halfday + main run double-buy)
+    if should_trade and not is_emergency and _already_traded_today():
+        logger.info("Already traded today, skipping execution (dedup)")
+        should_trade = False
+
     execution_result = {"executed": False, "action": "HOLD", "order": None, "reason": "Gates failed"}
 
     if should_trade and target["action"] != "HOLD":
@@ -511,7 +534,7 @@ def cmd_run(halfday_check: bool = False):
     # Log regime change
     if signals["regime_changed"] and signals["previous_regime"]:
         regime_data = {
-            "date": date.today().isoformat(),
+            "date": datetime.now(ET).date().isoformat(),
             "qqq_close": signals["qqq_close"],
             "qqq_sma_50": signals["sma_50"],
             "qqq_sma_250": signals["sma_250"],
@@ -535,8 +558,9 @@ def cmd_run(halfday_check: bool = False):
 
     # Log decision
     order = execution_result.get("order") or {}
+    today_et = datetime.now(ET).date().isoformat()
     decision = {
-        "date": date.today().isoformat(),
+        "date": today_et,
         "timestamp": _timestamp(),
         "qqq_close": signals["qqq_close"],
         "qqq_sma_50": signals["sma_50"],
@@ -586,7 +610,7 @@ def cmd_run(halfday_check: bool = False):
     tqqq_val = data["tqqq_position"]["market_value"] if data["tqqq_position"] else 0
     tqqq_pnl = data["tqqq_position"]["unrealized_pl"] if data["tqqq_position"] else 0
     perf = {
-        "date": date.today().isoformat(),
+        "date": today_et,
         "tqqq_shares": signals["current_shares"],
         "tqqq_avg_cost": data["tqqq_position"]["avg_entry_price"] if data["tqqq_position"] else 0,
         "tqqq_current_price": signals["tqqq_price"],
@@ -773,7 +797,7 @@ def cmd_backtest():
     init_tables()
 
     # Fetch historical data (2+ years)
-    end = date.today()
+    end = datetime.now(ET).date()
     start = end - timedelta(days=900)  # ~2.5 years
     conn = get_connection()
 

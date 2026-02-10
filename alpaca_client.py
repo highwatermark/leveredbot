@@ -12,6 +12,7 @@ import time
 import logging
 from datetime import datetime, date, timedelta
 
+import pytz
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetCalendarRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -20,6 +21,8 @@ from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest
 from alpaca.data.timeframe import TimeFrame
 
 from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, LEVERAGE_CONFIG
+
+ET = pytz.timezone("America/New_York")
 
 logger = logging.getLogger(__name__)
 
@@ -170,11 +173,17 @@ def get_calendar(target_date: str) -> dict | None:
         if not cal:
             return None
         day = cal[0]
+        # day.close is a datetime object — extract the time portion for half-day check
+        close_time = day.close
+        if hasattr(close_time, "hour"):
+            is_half = close_time.hour < 16 or (close_time.hour == 13 and close_time.minute == 0)
+        else:
+            is_half = str(close_time) != "16:00"
         return {
             "date": str(day.date) if hasattr(day, "date") else target_date,
             "open": str(day.open),
             "close": str(day.close),
-            "is_half_day": str(day.close) != "16:00",
+            "is_half_day": is_half,
         }
     return _retry(_call, "get_calendar")
 

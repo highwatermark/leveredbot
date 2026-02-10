@@ -6,10 +6,14 @@ Daily runs fetch only the latest day; backtest loads full history once.
 """
 
 import sqlite3
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+
+import pytz
 
 from config import DB_PATH
 from db.models import get_connection
+
+ET = pytz.timezone("America/New_York")
 
 
 def _ensure_cache_table(conn: sqlite3.Connection) -> None:
@@ -126,7 +130,7 @@ def get_bars_with_cache(
 
     _ensure_cache_table(conn)
 
-    today = date.today()
+    today = datetime.now(ET).date()
     start_date = today - timedelta(days=days)
 
     # Check what we have cached

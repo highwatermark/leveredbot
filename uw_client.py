@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, timedelta
 
 import httpx
+import pytz
 
 from config import UW_API_KEY, LEVERAGE_CONFIG
 
@@ -73,8 +74,8 @@ def get_tqqq_flow(lookback_hours: int | None = None) -> dict:
             neutral["error"] = "No flow alerts returned"
             return neutral
 
-        # Filter to lookback window
-        cutoff = datetime.now() - timedelta(hours=lookback_hours)
+        # Filter to lookback window (use UTC for consistent comparison with API timestamps)
+        cutoff = datetime.now(pytz.UTC) - timedelta(hours=lookback_hours)
         put_premium = 0.0
         call_premium = 0.0
         count = 0
@@ -85,7 +86,10 @@ def get_tqqq_flow(lookback_hours: int | None = None) -> dict:
             if alert_time:
                 try:
                     ts = datetime.fromisoformat(alert_time.replace("Z", "+00:00"))
-                    if ts.replace(tzinfo=None) < cutoff:
+                    # Ensure ts is timezone-aware for comparison
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=pytz.UTC)
+                    if ts < cutoff:
                         continue
                 except (ValueError, TypeError):
                     pass

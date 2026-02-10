@@ -12,7 +12,11 @@ import sqlite3
 from datetime import datetime, date
 from pathlib import Path
 
+import pytz
+
 from config import DB_PATH
+
+ET = pytz.timezone("America/New_York")
 
 
 def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
@@ -219,7 +223,7 @@ def log_regime_change(
         "INSERT INTO regimes (date, old_regime, new_regime, qqq_close, qqq_sma_50, qqq_sma_250, trigger_reason) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
-            data.get("date", date.today().isoformat()),
+            data.get("date", datetime.now(ET).date().isoformat()),
             old,
             new,
             data.get("qqq_close"),
@@ -290,7 +294,7 @@ def get_regime_duration_days(conn: sqlite3.Connection | None = None) -> int:
         return 999  # No regime changes recorded, treat as long-standing
 
     change_date = date.fromisoformat(row["date"])
-    return (date.today() - change_date).days
+    return (datetime.now(ET).date() - change_date).days
 
 
 def get_consecutive_losing_days(conn: sqlite3.Connection | None = None) -> int:
@@ -404,7 +408,7 @@ def get_today_pregame(conn: sqlite3.Connection | None = None) -> dict | None:
         conn = get_connection()
         close_after = True
 
-    today_str = date.today().isoformat()
+    today_str = datetime.now(ET).date().isoformat()
     row = conn.execute(
         "SELECT * FROM pregame WHERE date = ? ORDER BY id DESC LIMIT 1",
         [today_str],
