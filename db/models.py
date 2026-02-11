@@ -10,7 +10,7 @@ Uses raw SQL with sqlite3 for simplicity. Three tables:
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import pytz
@@ -412,6 +412,18 @@ def get_strategy_state(conn: sqlite3.Connection | None = None) -> dict:
             "regime_duration_days": regime_duration,
             "consecutive_losing_days": losing_days,
         }
+
+
+def get_regime_history(days: int = 30, conn: sqlite3.Connection | None = None) -> list[dict]:
+    """Get regime transitions from the last N days."""
+    with get_db(conn) as c:
+        cutoff = (datetime.now(ET).date() - timedelta(days=days)).isoformat()
+        rows = c.execute(
+            "SELECT date, old_regime, new_regime, qqq_close, qqq_sma_50, qqq_sma_250, trigger_reason "
+            "FROM regimes WHERE date >= ? ORDER BY id DESC",
+            [cutoff],
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def get_position_entry_date(conn: sqlite3.Connection | None = None) -> str | None:

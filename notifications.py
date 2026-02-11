@@ -132,6 +132,12 @@ def send_daily_report(data: dict) -> bool:
         f"P/L: {tqqq_pnl:+.1f}%\n"
     )
 
+    # QQQ benchmark comparison (when holding a position)
+    qqq_bench = data.get("qqq_benchmark_pct")
+    if qqq_bench is not None and current_shares > 0:
+        vs_label = "outperforming" if tqqq_pnl > qqq_bench else "underperforming"
+        text += f"Benchmark: QQQ {qqq_bench:+.1f}% ({vs_label})\n"
+
     # SQQQ position (if held)
     sqqq_shares = data.get("sqqq_current_shares", 0)
     if sqqq_shares > 0:

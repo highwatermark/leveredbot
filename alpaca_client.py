@@ -62,6 +62,7 @@ def _retry(fn, description: str = "API call"):
 
     Retryable: ConnectionError, TimeoutError, httpx transport/status errors.
     Non-retryable (ValueError, TypeError, auth errors, etc.) propagate immediately.
+    After all retries exhausted, sends a Telegram alert before re-raising.
     """
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -72,6 +73,16 @@ def _retry(fn, description: str = "API call"):
             logger.warning(f"{description} attempt {attempt}/{MAX_RETRIES} failed: {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY)
+    # All retries exhausted — alert via Telegram
+    logger.error(f"{description} failed after {MAX_RETRIES} retries: {last_error}")
+    try:
+        import notifications
+        notifications.send_error(
+            "API Retries Exhausted",
+            f"{description} failed after {MAX_RETRIES} attempts.\nLast error: {last_error}",
+        )
+    except Exception:
+        pass  # Don't let notification failure mask the original error
     raise last_error
 
 

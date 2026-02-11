@@ -29,12 +29,15 @@ def _make_bull_closes(n=310):
 
 
 def _make_bars_from_closes(closes):
-    """Convert closes list to bar dicts with dates."""
+    """Convert closes list to bar dicts with dates ending near today."""
     from datetime import date, timedelta
-    start = date(2024, 1, 2)
+    import pytz
+    today = datetime.now(pytz.timezone("America/New_York")).date()
+    # Work backwards from today so data is never stale
+    n = len(closes)
     bars = []
     for i, close in enumerate(closes):
-        d = start + timedelta(days=i * 7 // 5)  # ~weekdays
+        d = today - timedelta(days=(n - 1 - i) * 7 // 5)  # ~weekdays, ending today
         bars.append({
             "date": d.isoformat(),
             "open": close * 0.999,

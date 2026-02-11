@@ -210,20 +210,29 @@ def _compute_signals(data: "MarketData", conn=None) -> "StrategySignals":
     if LEVERAGE_CONFIG.get("use_knn_signal", False):
         try:
             from strategy.knn_signal import KNNSignal
+            from strategy.vix_data import get_vix_data
             from pathlib import Path
 
             model_path = Path(__file__).parent / LEVERAGE_CONFIG.get("knn_model_path", "data/knn_model.pkl")
             knn = KNNSignal()
 
+            # Fetch VIX data (cached, append-only)
+            vix_by_date = {}
+            try:
+                vix_by_date = get_vix_data()
+            except Exception as e:
+                logger.warning(f"VIX data fetch failed, using defaults: {e}")
+
             # Try loading cached model first, else train from bars
+            loaded = False
             if model_path.exists():
-                knn.load(model_path)
-            elif len(data.qqq_bars) >= 400:
-                knn.fit_from_bars(data.qqq_bars)
+                loaded = knn.load(model_path)
+            if not loaded and len(data.qqq_bars) >= 400:
+                knn.fit_from_bars(data.qqq_bars, vix_by_date=vix_by_date)
                 knn.save(model_path)
 
             if knn.is_fitted:
-                knn_result = knn.predict(data.qqq_bars)
+                knn_result = knn.predict(data.qqq_bars, vix_by_date=vix_by_date)
                 knn_direction = knn_result["direction"]
                 knn_confidence = knn_result["confidence"]
                 knn_adjustment = knn_result["adjustment"]
@@ -273,7 +282,20 @@ def _compute_signals(data: "MarketData", conn=None) -> "StrategySignals":
     )
 
 
-def _build_gate_data(signals: "StrategySignals") -> dict:
+def _is_execution_window(is_half_day: bool = False) -> bool:
+    """Check if current time is within the execution window (±10 min of target)."""
+    now = datetime.now(ET)
+    if is_half_day:
+        target = LEVERAGE_CONFIG["execution_time_halfday"]
+    else:
+        target = LEVERAGE_CONFIG["execution_time_normal"]
+    hour, minute = map(int, target.split(":"))
+    target_minutes = hour * 60 + minute
+    now_minutes = now.hour * 60 + now.minute
+    return abs(now_minutes - target_minutes) <= 10
+
+
+def _build_gate_data(signals: "StrategySignals", is_half_day: bool = False) -> dict:
     """Build the gate checklist input dict from computed signals."""
     return {
         "regime": signals.effective_regime,
@@ -286,7 +308,7 @@ def _build_gate_data(signals: "StrategySignals") -> dict:
         "daily_loss_pct": signals.daily_loss_pct,
         "qqq_closes": signals.qqq_closes,
         "holding_days_losing": signals.consecutive_losing_days,
-        "is_execution_window": True,
+        "is_execution_window": _is_execution_window(is_half_day),
         "allocated_capital": signals.allocated_capital,
         "day_trades_remaining": signals.day_trades_remaining,
         "options_flow_bearish": signals.options_flow_bearish,
@@ -314,14 +336,14 @@ def _build_sizing_data(signals: "StrategySignals") -> dict:
     }
 
 
-def _build_sqqq_gate_data(signals: "StrategySignals") -> dict:
+def _build_sqqq_gate_data(signals: "StrategySignals", is_half_day: bool = False) -> dict:
     """Build the SQQQ gate checklist input dict from computed signals."""
     return {
         "knn_direction": signals.knn_direction,
         "knn_confidence": signals.knn_confidence,
         "vol_regime": signals.vol_regime,
         "allocated_capital": signals.allocated_capital,
-        "is_execution_window": True,
+        "is_execution_window": _is_execution_window(is_half_day),
         "day_trades_remaining": signals.day_trades_remaining,
         "trading_days_fetched": signals.trading_days_fetched,
         "has_tqqq_position": signals.has_tqqq_position,
@@ -702,6 +724,17 @@ def cmd_run(halfday_check: bool = False):
             notifications.send_error("Insufficient Data", msg)
             return
 
+        # Data staleness check: last bar should be from today or previous trading day
+        if data.qqq_bars:
+            last_bar_date = date.fromisoformat(data.qqq_bars[-1]["date"])
+            today = datetime.now(ET).date()
+            days_stale = (today - last_bar_date).days
+            if days_stale > 3:  # Allow weekends (2 days) + 1 buffer
+                msg = f"Data is stale: last bar is {data.qqq_bars[-1]['date']} ({days_stale} days old)"
+                logger.error(msg)
+                notifications.send_error("Stale Data", msg)
+                return
+
         # Update high watermark if holding managed positions
         if LEVERAGE_CONFIG.get("pm_enabled", True):
             try:
@@ -735,7 +768,7 @@ def cmd_run(halfday_check: bool = False):
             logger.info("No pregame intel available for today")
 
         # Run gate checklist
-        gates_passed, gates_failed = run_gate_checklist(_build_gate_data(signals))
+        gates_passed, gates_failed = run_gate_checklist(_build_gate_data(signals, data.is_half_day))
 
         # Calculate target position
         target = calculate_target_shares(_build_sizing_data(signals))
@@ -848,7 +881,7 @@ def cmd_run(halfday_check: bool = False):
         sqqq_execution_result = {"executed": False, "action": "HOLD"}
 
         if LEVERAGE_CONFIG.get("use_sqqq_trading", False):
-            sqqq_gates_passed, sqqq_gates_failed = run_sqqq_gate_checklist(_build_sqqq_gate_data(signals))
+            sqqq_gates_passed, sqqq_gates_failed = run_sqqq_gate_checklist(_build_sqqq_gate_data(signals, data.is_half_day))
             sqqq_target = calculate_sqqq_target_shares(_build_sqqq_sizing_data(signals))
             logger.info(f"SQQQ gates: {'PASS' if sqqq_gates_passed else 'FAIL'} ({sqqq_gates_failed})")
             logger.info(f"SQQQ target: {sqqq_target['target_shares']} shares ({sqqq_target['action']})")
@@ -965,6 +998,18 @@ def cmd_run(halfday_check: bool = False):
         }
         log_daily_performance(perf, conn)
 
+        # Compute QQQ benchmark return (since position entry)
+        qqq_benchmark_pct = 0.0
+        if data.tqqq_position and data.tqqq_position["qty"] > 0:
+            from db.models import get_position_entry_date
+            entry_date = get_position_entry_date(conn)
+            if entry_date and data.qqq_bars:
+                entry_bars = [b for b in data.qqq_bars if b["date"] >= entry_date]
+                if len(entry_bars) >= 2:
+                    qqq_entry_price = entry_bars[0]["close"]
+                    if qqq_entry_price > 0:
+                        qqq_benchmark_pct = ((signals.qqq_close - qqq_entry_price) / qqq_entry_price) * 100
+
         # Send daily report
         report_data = {
             "regime": signals.effective_regime,
@@ -980,7 +1025,8 @@ def cmd_run(halfday_check: bool = False):
             "options_flow_ratio": signals.options_flow_ratio,
             "options_flow_bearish": signals.options_flow_bearish,
             "trading_days_fetched": signals.trading_days_fetched,
-            "gates_passed": 14 - len(gates_failed),
+            "gates_passed": 16 - len(gates_failed),
+            "qqq_benchmark_pct": round(qqq_benchmark_pct, 2),
             "gates_failed_list": gates_failed,
             "day_trades_remaining": signals.day_trades_remaining,
             "order_action": execution_result.get("action", target["action"]),
@@ -1198,10 +1244,19 @@ def cmd_backtest():
         "disagree_knn_right": 0, "disagree_knn_wrong": 0,
     }
 
+    # Fetch VIX data for k-NN features
+    vix_by_date = {}
+    if LEVERAGE_CONFIG.get("use_knn_signal", False):
+        try:
+            from strategy.vix_data import get_vix_data
+            vix_by_date = get_vix_data()
+        except Exception as e:
+            logger.warning(f"VIX data fetch failed for backtest, using defaults: {e}")
+
     if LEVERAGE_CONFIG.get("use_knn_signal", False) and len(knn_bars) > knn_train_cutoff + 50:
         from strategy.knn_signal import KNNSignal, FeatureCalculator
         knn_model = KNNSignal(n_neighbors=LEVERAGE_CONFIG.get("knn_neighbors", 7))
-        if not knn_model.fit_from_bars(knn_bars[:knn_train_cutoff + 1]):
+        if not knn_model.fit_from_bars(knn_bars[:knn_train_cutoff + 1], vix_by_date=vix_by_date):
             logger.warning("k-NN training failed for backtest validation")
             knn_model = None
         else:
@@ -1255,7 +1310,7 @@ def cmd_backtest():
 
         # k-NN validation: predict and compare against actual next-day return
         if knn_model is not None and i >= knn_train_cutoff and i + 1 < len(common_dates):
-            features = FeatureCalculator.compute_features(knn_bars, i)
+            features = FeatureCalculator.compute_features(knn_bars, i, vix_by_date=vix_by_date)
             if features is not None:
                 X_scaled = knn_model.scaler.transform(features.reshape(1, -1))
                 probs = knn_model.model.predict_proba(X_scaled)[0]

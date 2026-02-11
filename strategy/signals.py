@@ -19,14 +19,15 @@ def calculate_momentum(
     Calculate blended momentum score from rate-of-change values.
 
     Blends 5-day ROC (40% weight) and 20-day ROC (60% weight) into
-    a 0-1 normalized score. Score of 0.3+ is the minimum to hold positions.
+    a 0-1 normalized score using historical percentile ranking.
+    Score of 0.3+ is the minimum to hold positions.
 
     Returns:
         {
             "roc_fast": float,    # 5-day rate of change
             "roc_slow": float,    # 20-day rate of change
             "raw_score": float,   # Blended raw value
-            "score": float,       # Normalized 0-1
+            "score": float,       # Normalized 0-1 (percentile rank)
         }
     """
     if roc_fast is None:
@@ -44,11 +45,26 @@ def calculate_momentum(
     # Blend: 60% slow + 40% fast
     raw = roc_slow_val * 0.6 + roc_fast_val * 0.4
 
-    # Normalize to 0-1 using empirical bounds:
-    # QQQ ROC typically ranges from -0.15 to +0.15
-    # Map -0.10 to 0 and +0.10 to 1 (linear)
-    normalized = (raw + 0.10) / 0.20
-    normalized = max(0.0, min(1.0, normalized))
+    # Normalize via historical percentile: compute blended ROC for each
+    # available historical point and rank current value among them.
+    lookback = min(len(closes), 252)  # Use up to 1 year of history
+    if lookback > roc_slow + 1:
+        historical_raws = []
+        for i in range(roc_slow + 1, lookback):
+            idx = len(closes) - lookback + i
+            c = closes[idx]
+            c_fast = closes[idx - roc_fast]
+            c_slow = closes[idx - roc_slow]
+            rf = (c - c_fast) / c_fast if c_fast > 0 else 0
+            rs = (c - c_slow) / c_slow if c_slow > 0 else 0
+            historical_raws.append(rs * 0.6 + rf * 0.4)
+        # Percentile rank: fraction of historical values <= current
+        below = sum(1 for h in historical_raws if h <= raw)
+        normalized = below / len(historical_raws)
+    else:
+        # Fallback to fixed bounds if insufficient history
+        normalized = (raw + 0.10) / 0.20
+        normalized = max(0.0, min(1.0, normalized))
 
     return {
         "roc_fast": round(roc_fast_val, 4),

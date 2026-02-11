@@ -2,7 +2,7 @@
 Position sizing and entry gate checklist.
 
 Contains the single `get_allocated_capital()` function for DRY capital isolation,
-the 14-gate entry checklist, and the full target position calculator.
+the 16-gate entry checklist, and the full target position calculator.
 """
 
 from datetime import date
@@ -83,7 +83,7 @@ def get_allocated_capital(
 
 def run_gate_checklist(data: dict) -> tuple[bool, list[str]]:
     """
-    Run the 14-gate entry checklist. ALL gates must pass for a buy order.
+    Run the 16-gate entry checklist. ALL gates must pass for a buy order.
 
     Args:
         data: Dict containing all required signals and state:
