@@ -198,6 +198,9 @@ class TestDataStalenessCheck:
              patch("alpaca_client.get_calendar", return_value=mock_calendar), \
              patch("alpaca_client.get_snapshot", return_value=mock_snapshot), \
              patch("db.cache.get_bars_with_cache", return_value=bars), \
+             patch("uw_client.get_combined_flow", return_value={"put_premium": 5e6, "call_premium": 6e6,
+                   "ratio": 0.83, "is_bearish": False, "adjustment_factor": 1.0,
+                   "alert_count": 45, "error": None}), \
              patch("uw_client.get_tqqq_flow", return_value={"put_premium": 5e6, "call_premium": 6e6,
                    "ratio": 0.83, "is_bearish": False, "adjustment_factor": 1.0,
                    "alert_count": 45, "error": None}):
@@ -262,6 +265,9 @@ class TestDataStalenessCheck:
                  "order_id": "test-123", "status": "filled", "symbol": "TQQQ",
                  "qty": 50, "side": "buy", "filled_avg_price": 50.64, "filled_qty": 50}), \
              patch("db.cache.get_bars_with_cache", return_value=bars), \
+             patch("uw_client.get_combined_flow", return_value={"put_premium": 5e6, "call_premium": 6e6,
+                   "ratio": 0.83, "is_bearish": False, "adjustment_factor": 1.0,
+                   "alert_count": 45, "error": None}), \
              patch("uw_client.get_tqqq_flow", return_value={"put_premium": 5e6, "call_premium": 6e6,
                    "ratio": 0.83, "is_bearish": False, "adjustment_factor": 1.0,
                    "alert_count": 45, "error": None}):

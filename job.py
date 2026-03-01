@@ -246,6 +246,11 @@ def _compute_signals(data: "MarketData", conn=None) -> "StrategySignals":
     knn_confidence = 0.5
     knn_adjustment = 1.0
     knn_probabilities = [0.5, 0.5]
+    # XGBoost signal (always tracked separately)
+    xgb_direction = "FLAT"
+    xgb_confidence = 0.5
+    xgb_adjustment = 1.0
+    xgb_probabilities = [0.5, 0.5]
 
     if LEVERAGE_CONFIG.get("use_knn_signal", False):
         try:
@@ -281,7 +286,7 @@ def _compute_signals(data: "MarketData", conn=None) -> "StrategySignals":
                         knn_confidence = knn_result["confidence"]
                         knn_adjustment = knn_result["adjustment"]
                         knn_probabilities = knn_result["probabilities"]
-                    logger.info(f"k-NN: {knn_result['direction']} (conf={knn_result['confidence']:.2f}, adj={knn_result['adjustment']})")
+                    logger.info(f"k-NN: {knn_result['direction']} (conf={knn_result['confidence']:.2f}, adj={knn_result['adjustment']}, P(down)={knn_result['probabilities'][0]:.2f}, P(up)={knn_result['probabilities'][1]:.2f})")
 
             # Run XGBoost if selected
             if prediction_model in ("xgb", "both"):
@@ -296,13 +301,18 @@ def _compute_signals(data: "MarketData", conn=None) -> "StrategySignals":
                     xgb.save(xgb_model_path)
                 if xgb.is_fitted:
                     xgb_result = xgb.predict(data.qqq_bars, vix_by_date=vix_by_date, cross_asset_bars=cross_bars, microstructure_by_date=micro_data)
-                    # When "xgb" is primary, use its result for sizing
+                    # Always capture XGB results separately
+                    xgb_direction = xgb_result["direction"]
+                    xgb_confidence = xgb_result["confidence"]
+                    xgb_adjustment = xgb_result["adjustment"]
+                    xgb_probabilities = xgb_result["probabilities"]
+                    # When "xgb" is primary, also use its result for sizing
                     if prediction_model == "xgb":
                         knn_direction = xgb_result["direction"]
                         knn_confidence = xgb_result["confidence"]
                         knn_adjustment = xgb_result["adjustment"]
                         knn_probabilities = xgb_result["probabilities"]
-                    logger.info(f"XGBoost: {xgb_result['direction']} (conf={xgb_result['confidence']:.2f}, adj={xgb_result['adjustment']})")
+                    logger.info(f"XGBoost: {xgb_direction} (conf={xgb_confidence:.2f}, adj={xgb_adjustment}, P(down)={xgb_probabilities[0]:.2f}, P(up)={xgb_probabilities[1]:.2f})")
 
         except Exception as e:
             logger.warning(f"Prediction model signal failed, using neutral: {e}")
@@ -345,6 +355,10 @@ def _compute_signals(data: "MarketData", conn=None) -> "StrategySignals":
         knn_confidence=knn_confidence,
         knn_adjustment=knn_adjustment,
         knn_probabilities=knn_probabilities,
+        xgb_direction=xgb_direction,
+        xgb_confidence=xgb_confidence,
+        xgb_adjustment=xgb_adjustment,
+        xgb_probabilities=xgb_probabilities,
     )
 
 
@@ -904,6 +918,9 @@ def cmd_run(halfday_check: bool = False):
             "knn_direction": signals.knn_direction,
             "knn_confidence": round(signals.knn_confidence, 4),
             "knn_adjustment": signals.knn_adjustment,
+            "xgb_direction": signals.xgb_direction,
+            "xgb_confidence": round(signals.xgb_confidence, 4),
+            "xgb_adjustment": signals.xgb_adjustment,
             "symbol": "TQQQ",
             "sqqq_position_value": data.sqqq_position["market_value"] if data.sqqq_position else 0,
             "sqqq_pnl_pct": data.sqqq_position["unrealized_plpc"] * 100 if data.sqqq_position else 0,
@@ -1105,11 +1122,19 @@ def cmd_run(halfday_check: bool = False):
             "knn_direction": signals.knn_direction,
             "knn_confidence": signals.knn_confidence,
             "knn_adjustment": signals.knn_adjustment,
+            "knn_probabilities": signals.knn_probabilities,
+            "xgb_direction": signals.xgb_direction,
+            "xgb_confidence": signals.xgb_confidence,
+            "xgb_adjustment": signals.xgb_adjustment,
+            "xgb_probabilities": signals.xgb_probabilities,
             "sqqq_current_shares": signals.sqqq_current_shares,
             "sqqq_position_value": sqqq_val,
             "sqqq_pnl_pct": perf["sqqq_pnl_pct"],
             "sqqq_action": sqqq_action,
             "sqqq_order_shares": sqqq_order_shares,
+            "pct_above_sma50": signals.pct_above_sma50,
+            "pct_above_sma250": signals.pct_above_sma250,
+            "effective_regime": signals.effective_regime,
         }
         if pregame:
             report_data["pregame_sentiment"] = pregame["pregame_sentiment"]
@@ -1176,6 +1201,12 @@ def cmd_status():
         print(f"  P(down)={probs[0]:.2f}  P(up)={probs[1]:.2f}")
     report_only = LEVERAGE_CONFIG.get("knn_report_only", True)
     print(f"  Mode: {'REPORT-ONLY' if report_only else 'ACTIVE'}")
+
+    # XGBoost Signal
+    print(f"\nXGBoost Signal: {signals.xgb_direction} (conf={signals.xgb_confidence:.2f}, adj={signals.xgb_adjustment})")
+    if signals.xgb_direction != "FLAT":
+        xgb_probs = signals.xgb_probabilities
+        print(f"  P(down)={xgb_probs[0]:.2f}  P(up)={xgb_probs[1]:.2f}")
 
     # Position
     tqqq = data.tqqq_position

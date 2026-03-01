@@ -111,6 +111,10 @@ def init_tables(conn: sqlite3.Connection | None = None) -> None:
             knn_confidence REAL DEFAULT 0.5,
             knn_adjustment REAL DEFAULT 1.0,
 
+            xgb_direction TEXT DEFAULT 'FLAT',
+            xgb_confidence REAL DEFAULT 0.5,
+            xgb_adjustment REAL DEFAULT 1.0,
+
             symbol TEXT DEFAULT 'TQQQ',
             sqqq_position_value REAL DEFAULT 0,
             sqqq_pnl_pct REAL DEFAULT 0,
@@ -270,6 +274,17 @@ def init_tables(conn: sqlite3.Connection | None = None) -> None:
                     c.execute(f"SELECT {col} FROM {table} LIMIT 0")
                 except sqlite3.OperationalError:
                     c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type} DEFAULT {default}")
+
+        # Migration: add XGBoost columns for existing databases
+        for col, col_type, default in [
+            ("xgb_direction", "TEXT", "'FLAT'"),
+            ("xgb_confidence", "REAL", "0.5"),
+            ("xgb_adjustment", "REAL", "1.0"),
+        ]:
+            try:
+                c.execute(f"SELECT {col} FROM decisions LIMIT 0")
+            except sqlite3.OperationalError:
+                c.execute(f"ALTER TABLE decisions ADD COLUMN {col} {col_type} DEFAULT {default}")
 
 
 def log_daily_decision(data: dict, conn: sqlite3.Connection | None = None) -> int:

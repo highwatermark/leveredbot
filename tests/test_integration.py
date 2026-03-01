@@ -152,6 +152,7 @@ class TestCmdRunIntegration:
              patch("alpaca_client.get_snapshot", return_value=MOCK_SNAPSHOT), \
              patch("alpaca_client.submit_market_order", return_value=MOCK_ORDER), \
              patch("db.cache.get_bars_with_cache", return_value=BARS), \
+             patch("uw_client.get_combined_flow", return_value=MOCK_FLOW), \
              patch("uw_client.get_tqqq_flow", return_value=MOCK_FLOW):
 
             import job
@@ -186,6 +187,7 @@ class TestCmdRunIntegration:
              patch("alpaca_client.get_calendar", return_value=None), \
              patch("alpaca_client.get_snapshot", return_value=MOCK_SNAPSHOT), \
              patch("db.cache.get_bars_with_cache", return_value=BARS), \
+             patch("uw_client.get_combined_flow", return_value=MOCK_FLOW), \
              patch("uw_client.get_tqqq_flow", return_value=MOCK_FLOW):
 
             import job
@@ -210,6 +212,7 @@ class TestCmdRunIntegration:
              patch("alpaca_client.get_calendar", return_value=MOCK_CALENDAR), \
              patch("alpaca_client.get_snapshot", return_value=MOCK_SNAPSHOT), \
              patch("db.cache.get_bars_with_cache", return_value=short_bars), \
+             patch("uw_client.get_combined_flow", return_value=MOCK_FLOW), \
              patch("uw_client.get_tqqq_flow", return_value=MOCK_FLOW):
 
             import job
@@ -234,6 +237,7 @@ class TestCmdRunIntegration:
              patch("alpaca_client.get_calendar", return_value=MOCK_CALENDAR), \
              patch("alpaca_client.get_snapshot", return_value=MOCK_SNAPSHOT), \
              patch("db.cache.get_bars_with_cache", return_value=BARS), \
+             patch("uw_client.get_combined_flow", return_value=MOCK_FLOW), \
              patch("uw_client.get_tqqq_flow", return_value=MOCK_FLOW):
 
             import job

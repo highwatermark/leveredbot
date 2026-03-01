@@ -153,14 +153,81 @@ def send_daily_report(data: dict) -> bool:
         side = "Buy" if sqqq_action == "BUY" else "Sell"
         text += f"SQQQ Action: {side} {abs(sqqq_order)} shares\n"
 
-    # k-NN signal overlay (report-only)
+    # ── ML Predictions ──
     knn_dir = data.get("knn_direction", "FLAT")
-    if knn_dir != "FLAT":
-        knn_conf = data.get("knn_confidence", 0.5)
-        knn_emoji = "\U0001f7e2" if knn_dir == "LONG" else "\U0001f534"
-        text += f"\nk-NN Signal: {knn_emoji} {knn_dir} ({knn_conf:.0%} conf)\n"
+    knn_conf = data.get("knn_confidence", 0.5)
+    knn_probs = data.get("knn_probabilities", [0.5, 0.5])
+    xgb_dir = data.get("xgb_direction", "FLAT")
+    xgb_conf = data.get("xgb_confidence", 0.5)
+    xgb_probs = data.get("xgb_probabilities", [0.5, 0.5])
+
+    text += "\nNext-Day Prediction (QQQ)\n"
+    text += "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+
+    # k-NN
+    knn_emoji = {
+        "LONG": "\U0001f7e2", "SHORT": "\U0001f534",
+    }.get(knn_dir, "\u26aa")
+    text += f"k-NN:    {knn_emoji} {knn_dir} ({knn_conf:.0%} conf)\n"
+    text += f"         P(down)={knn_probs[0]:.0%}  P(up)={knn_probs[1]:.0%}\n"
+
+    # XGBoost
+    xgb_emoji = {
+        "LONG": "\U0001f7e2", "SHORT": "\U0001f534",
+    }.get(xgb_dir, "\u26aa")
+    text += f"XGBoost: {xgb_emoji} {xgb_dir} ({xgb_conf:.0%} conf)\n"
+    text += f"         P(down)={xgb_probs[0]:.0%}  P(up)={xgb_probs[1]:.0%}\n"
+
+    # Model agreement
+    if knn_dir == xgb_dir and knn_dir != "FLAT":
+        avg_conf = (knn_conf + xgb_conf) / 2
+        text += f"Models AGREE: {knn_dir} (avg {avg_conf:.0%} conf)\n"
+    elif knn_dir != xgb_dir and knn_dir != "FLAT" and xgb_dir != "FLAT":
+        text += f"Models DISAGREE: k-NN={knn_dir} vs XGB={xgb_dir}\n"
+
+    # ── Context & Reasoning ──
+    text += "\nReasoning\n"
+    text += "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+
+    reasons = []
+    pct_sma50 = data.get("qqq_pct_above_sma50", data.get("pct_above_sma50", 0))
+    pct_sma250 = data.get("qqq_pct_above_sma250", data.get("pct_above_sma250", 0))
+
+    # Trend context
+    if pct_sma50 > 3:
+        reasons.append(f"QQQ {pct_sma50:+.1f}% above SMA50 (strong uptrend)")
+    elif pct_sma50 > 0:
+        reasons.append(f"QQQ {pct_sma50:+.1f}% above SMA50 (mild uptrend)")
+    elif pct_sma50 > -3:
+        reasons.append(f"QQQ {pct_sma50:+.1f}% vs SMA50 (neutral/weak)")
     else:
-        text += f"\nk-NN Signal: \u26aa FLAT (low conviction)\n"
+        reasons.append(f"QQQ {pct_sma50:+.1f}% below SMA50 (downtrend)")
+
+    # Vol context
+    if vol_regime == "LOW":
+        reasons.append(f"Low vol ({vol:.0f}%) — favorable for leveraged holds")
+    elif vol_regime == "HIGH":
+        reasons.append(f"High vol ({vol:.0f}%) — elevated decay risk")
+    elif vol_regime == "EXTREME":
+        reasons.append(f"Extreme vol ({vol:.0f}%) — significant decay risk")
+
+    # Momentum context
+    if momentum > 0.6:
+        reasons.append(f"Strong momentum ({momentum:.2f})")
+    elif momentum < 0.3:
+        reasons.append(f"Weak momentum ({momentum:.2f})")
+
+    # Flow context
+    if data.get("options_flow_bearish"):
+        reasons.append(f"Bearish options flow (P/C {flow_ratio:.1f})")
+
+    # Gate failures
+    failed_gates = data.get("gates_failed_list", [])
+    if failed_gates:
+        reasons.append(f"Failed gates: {', '.join(failed_gates[:3])}")
+
+    for r in reasons:
+        text += f"  - {r}\n"
 
     # Pregame intel if available
     if data.get("pregame_sentiment"):

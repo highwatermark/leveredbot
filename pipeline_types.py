@@ -73,3 +73,8 @@ class StrategySignals:
     knn_confidence: float = 0.5
     knn_adjustment: float = 1.0
     knn_probabilities: list[float] = field(default_factory=lambda: [0.5, 0.5])
+    # XGBoost signal overlay
+    xgb_direction: str = "FLAT"
+    xgb_confidence: float = 0.5
+    xgb_adjustment: float = 1.0
+    xgb_probabilities: list[float] = field(default_factory=lambda: [0.5, 0.5])

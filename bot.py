@@ -104,8 +104,9 @@ def cmd_leverage(chat_id: int | str) -> None:
         f"  SMA50: ${signals.sma_50:.2f} ({signals.pct_above_sma50:+.1f}%)\n"
         f"  SMA250: ${signals.sma_250:.2f} ({signals.pct_above_sma250:+.1f}%)\n\n"
         f"Momentum: {signals.momentum_score:.2f}\n"
-        f"Vol: {signals.realized_vol:.1f}% ({signals.vol_regime})\n"
-        f"k-NN: {signals.knn_direction} ({signals.knn_confidence:.0%} conf)\n\n"
+        f"Vol: {signals.realized_vol:.1f}% ({signals.vol_regime})\n\n"
+        f"k-NN: {signals.knn_direction} ({signals.knn_confidence:.0%} conf)\n"
+        f"XGBoost: {signals.xgb_direction} ({signals.xgb_confidence:.0%} conf)\n\n"
         f"TQQQ: {pos_text}\n"
         f"{sqqq_text}\n"
         f"Allocated: ${signals.allocated_capital:,.0f}\n"
@@ -228,15 +229,21 @@ def cmd_leveragevol(chat_id: int | str) -> None:
 
 
 def cmd_leverageflow(chat_id: int | str) -> None:
-    """Show TQQQ options flow sentiment."""
+    """Show options flow sentiment (combined TQQQ+SQQQ or TQQQ-only)."""
     from db.models import init_tables
+    from config import LEVERAGE_CONFIG
     import uw_client
     from strategy.signals import check_options_flow
 
     init_tables()
 
     try:
-        flow = uw_client.get_tqqq_flow()
+        if LEVERAGE_CONFIG.get("use_combined_flow", False):
+            flow = uw_client.get_combined_flow()
+            flow_label = "Combined (TQQQ+SQQQ)"
+        else:
+            flow = uw_client.get_tqqq_flow()
+            flow_label = "TQQQ"
     except Exception as e:
         _send(chat_id, f"Error fetching flow: {e}")
         return
@@ -245,7 +252,7 @@ def cmd_leverageflow(chat_id: int | str) -> None:
     label = "BEARISH" if is_bearish else "NEUTRAL"
 
     text = (
-        f"TQQQ Options Flow\n{'=' * 25}\n\n"
+        f"{flow_label} Options Flow\n{'=' * 25}\n\n"
         f"Sentiment: {label}\n"
         f"P/C Ratio: {flow['ratio']:.2f}\n"
         f"Put Premium: ${flow['put_premium']:,.0f}\n"

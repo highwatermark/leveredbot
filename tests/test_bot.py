@@ -346,7 +346,7 @@ class TestCmdLeverageflow:
             "adjustment_factor": 1.0, "alert_count": 45, "error": None,
         }
         with patch("db.models.init_tables"), \
-             patch("uw_client.get_tqqq_flow", return_value=flow), \
+             patch("uw_client.get_combined_flow", return_value=flow), \
              patch("strategy.signals.check_options_flow", return_value=(False, 1.0)):
             from bot import cmd_leverageflow
             cmd_leverageflow(123)
@@ -363,7 +363,7 @@ class TestCmdLeverageflow:
             "adjustment_factor": 0.75, "alert_count": 70, "error": None,
         }
         with patch("db.models.init_tables"), \
-             patch("uw_client.get_tqqq_flow", return_value=flow), \
+             patch("uw_client.get_combined_flow", return_value=flow), \
              patch("strategy.signals.check_options_flow", return_value=(True, 0.75)):
             from bot import cmd_leverageflow
             cmd_leverageflow(123)
@@ -381,7 +381,7 @@ class TestCmdLeverageflow:
             "error": "Rate limited",
         }
         with patch("db.models.init_tables"), \
-             patch("uw_client.get_tqqq_flow", return_value=flow), \
+             patch("uw_client.get_combined_flow", return_value=flow), \
              patch("strategy.signals.check_options_flow", return_value=(False, 1.0)):
             from bot import cmd_leverageflow
             cmd_leverageflow(123)
@@ -392,7 +392,7 @@ class TestCmdLeverageflow:
     @patch("bot._send", return_value=True)
     def test_flow_fetch_error(self, mock_send):
         with patch("db.models.init_tables"), \
-             patch("uw_client.get_tqqq_flow", side_effect=RuntimeError("UW down")):
+             patch("uw_client.get_combined_flow", side_effect=RuntimeError("UW down")):
             from bot import cmd_leverageflow
             cmd_leverageflow(123)
 
