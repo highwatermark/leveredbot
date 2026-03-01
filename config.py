@@ -113,8 +113,11 @@ LEVERAGE_CONFIG = {
     # Combined UW flow (TQQQ + SQQQ)
     "use_combined_flow": True,
 
+    # Microstructure features (intraday-derived) — disabled, hurt accuracy in testing
+    "use_microstructure": False,
+
     # SQQQ (inverse) trading
-    "use_sqqq_trading": False,            # Enable SQQQ entries on k-NN SHORT signals
+    "use_sqqq_trading": True,             # Enable SQQQ entries on k-NN SHORT signals
     "sqqq_min_knn_confidence": 0.60,      # Minimum k-NN confidence for SQQQ entry
     "sqqq_max_position_pct": 0.40,        # Max 40% of allocated capital in SQQQ
 

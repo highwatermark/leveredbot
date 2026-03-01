@@ -121,7 +121,7 @@ def _fetch_all_data(use_cache: bool = True, conn=None) -> "MarketData":
 
     # Microstructure features (intraday-derived, cached)
     microstructure_by_date = {}
-    if LEVERAGE_CONFIG.get("use_knn_signal", False) and use_cache:
+    if LEVERAGE_CONFIG.get("use_microstructure", False) and LEVERAGE_CONFIG.get("use_knn_signal", False) and use_cache:
         try:
             from db.cache import get_microstructure_with_cache
             microstructure_by_date = get_microstructure_with_cache(
@@ -1327,13 +1327,14 @@ def cmd_backtest():
                 )
             except Exception as e:
                 logger.warning(f"Cross-asset bar fetch failed for {sym}: {e}")
-        try:
-            from db.cache import get_microstructure_with_cache
-            microstructure_by_date = get_microstructure_with_cache(
-                "QQQ", 900, alpaca_client.get_intraday_bars, conn
-            )
-        except Exception as e:
-            logger.warning(f"Microstructure fetch failed for backtest: {e}")
+        if LEVERAGE_CONFIG.get("use_microstructure", False):
+            try:
+                from db.cache import get_microstructure_with_cache
+                microstructure_by_date = get_microstructure_with_cache(
+                    "QQQ", 900, alpaca_client.get_intraday_bars, conn
+                )
+            except Exception as e:
+                logger.warning(f"Microstructure fetch failed for backtest: {e}")
 
     if LEVERAGE_CONFIG.get("use_knn_signal", False) and len(knn_bars) > knn_train_cutoff + 50:
         from strategy.knn_signal import KNNSignal, FeatureCalculator
