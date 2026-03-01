@@ -2,36 +2,45 @@
 k-NN direction prediction as a signal overlay.
 
 Predicts next-day QQQ direction (LONG/SHORT/FLAT) using distance-weighted
-k-NN classification on a 16-feature vector computed from daily bar data.
+k-NN classification on a 20-feature vector computed from daily bar data.
 
-Features (16):
+Features (20):
   # Price-based
-  1. intraday_return      - open→close return
-  2. prior_day_return     - previous day's close→close return
-  3. two_day_return       - 2-day cumulative return
-  4. five_day_return      - 5-day cumulative return
+  1. intraday_return      - open->close return
+  2. five_day_return      - 5-day cumulative return
   # Volatility
-  5. intraday_range       - (high-low)/open
-  6. atr_ratio            - current ATR vs 20-day avg ATR
+  3. intraday_range       - (high-low)/open
+  4. atr_ratio            - current ATR vs 20-day avg ATR
   # Trend
-  7. distance_from_20ma   - (close-MA20)/MA20
-  8. distance_from_50ma   - (close-MA50)/MA50
-  9. distance_from_200ma  - (close-MA200)/MA200
-  10. ma_20_50_cross      - (MA20-MA50)/close, normalized cross
+  5. distance_from_7ma    - (close-MA7)/MA7  (short-term mean reversion)
+  6. distance_from_50ma   - (close-MA50)/MA50
+  7. ma_7_20_cross        - (MA7-MA20)/close (fast cross signal)
+  8. ma_20_50_cross       - (MA20-MA50)/close, normalized cross
   # Momentum
-  11. rsi_14              - 14-day RSI (normalized 0-1)
-  12. rsi_deviation       - |RSI-50|/50, distance from neutral
-  13. momentum_10         - 10-day rate of change
+  9. rsi_14               - 14-day RSI (normalized 0-1)
   # Volume
-  14. volume_ratio        - today's volume vs 20-day average
+  10. volume_ratio        - today's volume vs 20-day average
   # VIX
-  15. vix_level           - current VIX / 100 (scaled)
-  16. vix_change          - daily VIX change (pct)
+  11. vix_level           - current VIX / 100 (scaled)
+  12. vix_change          - daily VIX change (pct)
+  # Cross-asset
+  13. tlt_return_5d       - 5-day TLT return (bond sentiment)
+  14. gld_return_5d       - 5-day GLD return (gold sentiment)
+  15. iwm_qqq_ratio_change_5d - 5-day change in IWM/QQQ ratio (breadth)
+  # Seasonality
+  16. day_of_week         - 0-4 scaled to 0.0-1.0
+  # Microstructure (intraday)
+  17. last_hour_volume_ratio  - volume(3-4pm) / volume(rest of day)
+  18. vwap_deviation          - (close - VWAP) / VWAP
+  19. closing_momentum        - last_30min_return - day_return
+  20. volume_acceleration     - volume(last 2h) / volume(first 2h)
 
 Usage:
     knn = KNNSignal()
-    knn.fit_from_bars(qqq_bars, vix_by_date=vix_data)
-    result = knn.predict(qqq_bars, vix_by_date=vix_data)
+    knn.fit_from_bars(qqq_bars, vix_by_date=vix_data, cross_asset_bars=cross,
+                      microstructure_by_date=micro)
+    result = knn.predict(qqq_bars, vix_by_date=vix_data, cross_asset_bars=cross,
+                         microstructure_by_date=micro)
 """
 
 import pickle
@@ -49,11 +58,14 @@ logger = logging.getLogger(__name__)
 # Minimum training samples required
 MIN_TRAINING_SAMPLES = 200
 
+# Feature version — bump when feature set changes to auto-reject old models
+FEATURE_VERSION = 3
+
 
 class FeatureCalculator:
-    """Compute the 16-feature vector from daily bar data + VIX."""
+    """Compute the 20-feature vector from daily bar data + VIX + cross-asset + microstructure."""
 
-    FEATURE_COUNT = 16
+    FEATURE_COUNT = 20
 
     # Default VIX values when data is unavailable (VIX ~20 is "normal")
     DEFAULT_VIX = 20.0
@@ -84,20 +96,85 @@ class FeatureCalculator:
         return high - low
 
     @staticmethod
+    def _get_cross_asset_return(
+        cross_asset_bars: dict[str, list[dict]],
+        symbol: str,
+        bar_date: str,
+        period: int = 5,
+    ) -> float:
+        """Get N-day return for a cross-asset symbol aligned to bar_date.
+
+        Returns 0.0 if data is unavailable or insufficient.
+        """
+        bars_list = cross_asset_bars.get(symbol, [])
+        if not bars_list:
+            return 0.0
+
+        # Build date->index lookup on first call (cached via dict)
+        date_idx = {b["date"]: i for i, b in enumerate(bars_list)}
+        idx = date_idx.get(bar_date)
+        if idx is None or idx < period:
+            return 0.0
+
+        current_close = bars_list[idx]["close"]
+        past_close = bars_list[idx - period]["close"]
+        if past_close <= 0:
+            return 0.0
+        return (current_close - past_close) / past_close
+
+    @staticmethod
+    def _get_iwm_qqq_ratio_change(
+        cross_asset_bars: dict[str, list[dict]],
+        qqq_close: float,
+        qqq_close_5d_ago: float,
+        bar_date: str,
+        period: int = 5,
+    ) -> float:
+        """5-day change in IWM/QQQ ratio.
+
+        Returns 0.0 if data is unavailable.
+        """
+        iwm_bars = cross_asset_bars.get("IWM", [])
+        if not iwm_bars:
+            return 0.0
+
+        date_idx = {b["date"]: i for i, b in enumerate(iwm_bars)}
+        idx = date_idx.get(bar_date)
+        if idx is None or idx < period:
+            return 0.0
+
+        iwm_now = iwm_bars[idx]["close"]
+        iwm_past = iwm_bars[idx - period]["close"]
+
+        if qqq_close <= 0 or qqq_close_5d_ago <= 0 or iwm_past <= 0:
+            return 0.0
+
+        ratio_now = iwm_now / qqq_close
+        ratio_past = iwm_past / qqq_close_5d_ago
+        if ratio_past <= 0:
+            return 0.0
+        return (ratio_now - ratio_past) / ratio_past
+
+    @staticmethod
     def compute_features(
-        bars: list[dict], index: int, vix_by_date: dict[str, float] | None = None,
+        bars: list[dict],
+        index: int,
+        vix_by_date: dict[str, float] | None = None,
+        cross_asset_bars: dict[str, list[dict]] | None = None,
+        microstructure_by_date: dict[str, dict[str, float]] | None = None,
     ) -> np.ndarray | None:
         """
-        Compute 16-feature vector at a given bar index.
+        Compute 20-feature vector at a given bar index.
 
         Args:
             bars: List of bar dicts with keys: date, open, high, low, close, volume
             index: Index of the bar to compute features for (needs 200+ bars before it)
-            vix_by_date: Optional mapping of date→VIX close for features 15-16.
-                         Falls back to defaults if None or date not found.
+            vix_by_date: Optional mapping of date->VIX close for VIX features.
+            cross_asset_bars: Optional mapping of symbol->bars for TLT, GLD, IWM.
+            microstructure_by_date: Optional mapping of date->microstructure features.
 
         Returns:
-            numpy array of 16 features, or None if insufficient data
+            numpy array of 20 features, or None if insufficient data
         """
         if index < 200:
             return None
@@ -110,24 +187,17 @@ class FeatureCalculator:
         high = bar["high"]
         low = bar["low"]
         close = bar["close"]
+        bar_date = bar.get("date", "")
+        prev_date = prev.get("date", "")
+
+        cross_asset_bars = cross_asset_bars or {}
 
         # ── Price-based ──
 
         # Feature 1: intraday return
         intraday_return = (close - open_price) / open_price if open_price > 0 else 0
 
-        # Feature 2: prior day return
-        prior_close = prev["close"]
-        prior_day_return = (close - prior_close) / prior_close if prior_close > 0 else 0
-
-        # Feature 3: 2-day return
-        if index >= 2:
-            two_day_ago = bars[index - 2]["close"]
-            two_day_return = (close - two_day_ago) / two_day_ago if two_day_ago > 0 else 0
-        else:
-            two_day_return = 0
-
-        # Feature 4: 5-day return
+        # Feature 2: 5-day return
         if index >= 5:
             five_day_ago = bars[index - 5]["close"]
             five_day_return = (close - five_day_ago) / five_day_ago if five_day_ago > 0 else 0
@@ -136,10 +206,10 @@ class FeatureCalculator:
 
         # ── Volatility ──
 
-        # Feature 5: intraday range
+        # Feature 3: intraday range
         intraday_range = (high - low) / open_price if open_price > 0 else 0
 
-        # Feature 6: ATR ratio — today's True Range vs 20-day average TR
+        # Feature 4: ATR ratio — today's True Range vs 20-day average TR
         if index >= 20:
             today_tr = FeatureCalculator._compute_true_range(bars, index)
             tr_values = [FeatureCalculator._compute_true_range(bars, i) for i in range(index - 19, index + 1)]
@@ -150,15 +220,15 @@ class FeatureCalculator:
 
         # ── Trend ──
 
-        # Feature 7: distance from 20-MA
-        if len(closes) >= 20:
-            ma20 = float(np.mean(closes[-20:]))
-            dist_20ma = (close - ma20) / ma20 if ma20 > 0 else 0
+        # Feature 5: distance from 7-MA (short-term mean reversion)
+        if len(closes) >= 7:
+            ma7 = float(np.mean(closes[-7:]))
+            dist_7ma = (close - ma7) / ma7 if ma7 > 0 else 0
         else:
-            ma20 = 0
-            dist_20ma = 0
+            ma7 = 0
+            dist_7ma = 0
 
-        # Feature 8: distance from 50-MA
+        # Feature 6: distance from 50-MA
         if len(closes) >= 50:
             ma50 = float(np.mean(closes[-50:]))
             dist_50ma = (close - ma50) / ma50 if ma50 > 0 else 0
@@ -166,14 +236,19 @@ class FeatureCalculator:
             ma50 = 0
             dist_50ma = 0
 
-        # Feature 9: distance from 200-MA
-        if len(closes) >= 200:
-            ma200 = float(np.mean(closes[-200:]))
-            dist_200ma = (close - ma200) / ma200 if ma200 > 0 else 0
+        # Compute MA20 for cross signals (not a standalone feature)
+        if len(closes) >= 20:
+            ma20 = float(np.mean(closes[-20:]))
         else:
-            dist_200ma = 0
+            ma20 = 0
 
-        # Feature 10: MA 20/50 cross — (MA20 - MA50) normalized by price
+        # Feature 7: MA 7/20 cross — (MA7 - MA20) normalized by price
+        if ma7 > 0 and ma20 > 0 and close > 0:
+            ma_7_20_cross = (ma7 - ma20) / close
+        else:
+            ma_7_20_cross = 0
+
+        # Feature 8: MA 20/50 cross — (MA20 - MA50) normalized by price
         if ma20 > 0 and ma50 > 0 and close > 0:
             ma_20_50_cross = (ma20 - ma50) / close
         else:
@@ -181,23 +256,13 @@ class FeatureCalculator:
 
         # ── Momentum ──
 
-        # Feature 11: RSI-14 (normalized 0-1)
+        # Feature 9: RSI-14 (normalized 0-1)
         rsi = FeatureCalculator.calculate_rsi(closes, period=14)
         rsi_normalized = rsi / 100.0
 
-        # Feature 12: RSI deviation — distance from neutral (50)
-        rsi_deviation = abs(rsi - 50.0) / 50.0
-
-        # Feature 13: 10-day momentum (rate of change)
-        if index >= 10:
-            ten_day_ago = bars[index - 10]["close"]
-            momentum_10 = (close - ten_day_ago) / ten_day_ago if ten_day_ago > 0 else 0
-        else:
-            momentum_10 = 0
-
         # ── Volume ──
 
-        # Feature 14: volume ratio — today vs 20-day average
+        # Feature 10: volume ratio — today vs 20-day average
         today_volume = bar.get("volume", 0) or 0
         if index >= 20 and today_volume > 0:
             volumes = [bars[i].get("volume", 0) or 0 for i in range(index - 19, index + 1)]
@@ -209,56 +274,106 @@ class FeatureCalculator:
         # ── VIX ──
 
         vix_by_date = vix_by_date or {}
-        bar_date = bar.get("date", "")
-        prev_date = prev.get("date", "")
 
         vix_today = vix_by_date.get(bar_date, FeatureCalculator.DEFAULT_VIX)
         vix_prev = vix_by_date.get(prev_date, FeatureCalculator.DEFAULT_VIX)
 
-        # Feature 15: VIX level (scaled to ~0-1 range; VIX 20 → 0.20)
+        # Feature 11: VIX level (scaled to ~0-1 range; VIX 20 -> 0.20)
         vix_level = vix_today / 100.0
 
-        # Feature 16: VIX daily change (percentage)
+        # Feature 12: VIX daily change (percentage)
         vix_change = (vix_today - vix_prev) / vix_prev if vix_prev > 0 else 0
 
+        # ── Cross-asset ──
+
+        # Feature 13: TLT 5-day return
+        tlt_return_5d = FeatureCalculator._get_cross_asset_return(
+            cross_asset_bars, "TLT", bar_date, period=5
+        )
+
+        # Feature 14: GLD 5-day return
+        gld_return_5d = FeatureCalculator._get_cross_asset_return(
+            cross_asset_bars, "GLD", bar_date, period=5
+        )
+
+        # Feature 15: IWM/QQQ ratio change 5d
+        qqq_close_5d_ago = bars[index - 5]["close"] if index >= 5 else close
+        iwm_qqq_ratio_change_5d = FeatureCalculator._get_iwm_qqq_ratio_change(
+            cross_asset_bars, close, qqq_close_5d_ago, bar_date, period=5
+        )
+
+        # ── Seasonality ──
+
+        # Feature 16: day of week (0=Monday .. 4=Friday, scaled to 0-1)
+        try:
+            from datetime import datetime as _dt
+            dt = _dt.strptime(bar_date, "%Y-%m-%d")
+            day_of_week = dt.weekday() / 4.0  # 0.0 - 1.0
+        except (ValueError, TypeError):
+            day_of_week = 0.5  # Fallback to midweek
+
+        # ── Microstructure ──
+        microstructure_by_date = microstructure_by_date or {}
+        micro = microstructure_by_date.get(bar_date, {})
+
+        # Feature 17: last_hour_volume_ratio
+        last_hour_volume_ratio = micro.get("last_hour_volume_ratio", 0.0)
+
+        # Feature 18: vwap_deviation
+        vwap_deviation_feat = micro.get("vwap_deviation", 0.0)
+
+        # Feature 19: closing_momentum
+        closing_momentum = micro.get("closing_momentum", 0.0)
+
+        # Feature 20: volume_acceleration
+        volume_acceleration = micro.get("volume_acceleration", 0.0)
+
         return np.array([
-            intraday_return,      # 1
-            prior_day_return,     # 2
-            two_day_return,       # 3
-            five_day_return,      # 4
-            intraday_range,       # 5
-            atr_ratio,            # 6
-            dist_20ma,            # 7
-            dist_50ma,            # 8
-            dist_200ma,           # 9
-            ma_20_50_cross,       # 10
-            rsi_normalized,       # 11
-            rsi_deviation,        # 12
-            momentum_10,          # 13
-            volume_ratio,         # 14
-            vix_level,            # 15
-            vix_change,           # 16
+            intraday_return,          # 0 - price
+            five_day_return,          # 1 - price
+            intraday_range,           # 2 - volatility
+            atr_ratio,                # 3 - volatility
+            dist_7ma,                 # 4 - trend
+            dist_50ma,                # 5 - trend
+            ma_7_20_cross,            # 6 - trend
+            ma_20_50_cross,           # 7 - trend
+            rsi_normalized,           # 8 - momentum
+            volume_ratio,             # 9 - volume
+            vix_level,                # 10 - vix
+            vix_change,               # 11 - vix
+            tlt_return_5d,            # 12 - cross-asset
+            gld_return_5d,            # 13 - cross-asset
+            iwm_qqq_ratio_change_5d,  # 14 - cross-asset
+            day_of_week,              # 15 - seasonality
+            last_hour_volume_ratio,   # 16 - microstructure
+            vwap_deviation_feat,      # 17 - microstructure
+            closing_momentum,         # 18 - microstructure
+            volume_acceleration,      # 19 - microstructure
         ])
 
     @staticmethod
     def feature_names() -> list[str]:
         return [
             "intraday_return",
-            "prior_day_return",
-            "two_day_return",
             "five_day_return",
             "intraday_range",
             "atr_ratio",
-            "distance_from_20ma",
+            "distance_from_7ma",
             "distance_from_50ma",
-            "distance_from_200ma",
+            "ma_7_20_cross",
             "ma_20_50_cross",
             "rsi_14",
-            "rsi_deviation",
-            "momentum_10",
             "volume_ratio",
             "vix_level",
             "vix_change",
+            "tlt_return_5d",
+            "gld_return_5d",
+            "iwm_qqq_ratio_change_5d",
+            "day_of_week",
+            "last_hour_volume_ratio",
+            "vwap_deviation",
+            "closing_momentum",
+            "volume_acceleration",
         ]
 
 
@@ -282,19 +397,20 @@ class KNNSignal:
         self.is_fitted = False
         self.training_samples = 0
         self.feature_count = FeatureCalculator.FEATURE_COUNT
+        self.feature_version = FEATURE_VERSION
 
     def fit_from_bars(
-        self, bars: list[dict], vix_by_date: dict[str, float] | None = None,
+        self,
+        bars: list[dict],
+        vix_by_date: dict[str, float] | None = None,
+        cross_asset_bars: dict[str, list[dict]] | None = None,
+        microstructure_by_date: dict[str, dict[str, float]] | None = None,
     ) -> bool:
         """
         Train the k-NN model from historical bar data.
 
-        Each training sample: features at day i → label is direction at day i+1.
+        Each training sample: features at day i -> label is direction at day i+1.
         Label: 1 if next day's close > today's close, else 0.
-
-        Args:
-            bars: List of bar dicts with open/high/low/close/volume
-            vix_by_date: Optional mapping of date→VIX close for VIX features.
 
         Returns:
             True if training succeeded, False if insufficient data
@@ -304,7 +420,7 @@ class KNNSignal:
         y = []
 
         for i in range(200, len(bars) - 1):
-            features = calc.compute_features(bars, i, vix_by_date=vix_by_date)
+            features = calc.compute_features(bars, i, vix_by_date=vix_by_date, cross_asset_bars=cross_asset_bars, microstructure_by_date=microstructure_by_date)
             if features is None:
                 continue
 
@@ -337,11 +453,18 @@ class KNNSignal:
         self.is_fitted = True
         self.training_samples = len(X)
         self.feature_count = FeatureCalculator.FEATURE_COUNT
+        self.feature_version = FEATURE_VERSION
 
         logger.info(f"k-NN model trained: {len(X)} samples, k={self.n_neighbors}, features={self.feature_count}")
         return True
 
-    def predict(self, bars: list[dict], vix_by_date: dict[str, float] | None = None) -> dict:
+    def predict(
+        self,
+        bars: list[dict],
+        vix_by_date: dict[str, float] | None = None,
+        cross_asset_bars: dict[str, list[dict]] | None = None,
+        microstructure_by_date: dict[str, dict[str, float]] | None = None,
+    ) -> dict:
         """
         Predict next-day direction from the latest bar data.
 
@@ -357,7 +480,7 @@ class KNNSignal:
             return self._neutral_prediction("Model not fitted")
 
         calc = FeatureCalculator()
-        features = calc.compute_features(bars, len(bars) - 1, vix_by_date=vix_by_date)
+        features = calc.compute_features(bars, len(bars) - 1, vix_by_date=vix_by_date, cross_asset_bars=cross_asset_bars, microstructure_by_date=microstructure_by_date)
         if features is None:
             return self._neutral_prediction("Insufficient feature data")
 
@@ -372,7 +495,7 @@ class KNNSignal:
 
         if confidence < self.min_confidence:
             direction = "FLAT"
-            adjustment = 0.75  # Low conviction → reduce 25%
+            adjustment = 0.75  # Low conviction -> reduce 25%
         elif p_up > p_down:
             direction = "LONG"
             adjustment = self._conviction_adjustment(confidence, bullish=True)
@@ -392,14 +515,14 @@ class KNNSignal:
         """
         Continuous conviction-based sizing adjustment.
 
-        LONG predictions: high confidence → no reduction.
-          0.55-0.65 → 1.0 (mild conviction, full size)
-          0.65+     → 1.0 (strong conviction, full size)
+        LONG predictions: high confidence -> no reduction.
+          0.55-0.65 -> 1.0 (mild conviction, full size)
+          0.65+     -> 1.0 (strong conviction, full size)
 
-        SHORT predictions: higher confidence → more reduction.
-          0.55-0.65 → 0.75 (mild disagreement, reduce 25%)
-          0.65-0.80 → linear from 0.75 down to 0.40
-          0.80+     → 0.40 (strong disagreement, reduce 60%)
+        SHORT predictions: higher confidence -> more reduction.
+          0.55-0.65 -> 0.75 (mild disagreement, reduce 25%)
+          0.65-0.80 -> linear from 0.75 down to 0.40
+          0.80+     -> 0.40 (strong disagreement, reduce 60%)
         """
         if bullish:
             return 1.0
@@ -410,7 +533,7 @@ class KNNSignal:
         elif confidence >= 0.80:
             return 0.40
         else:
-            # Linear interpolation: 0.65→0.75, 0.80→0.40
+            # Linear interpolation: 0.65->0.75, 0.80->0.40
             t = (confidence - 0.65) / (0.80 - 0.65)
             return 0.75 - t * 0.35
 
@@ -436,14 +559,15 @@ class KNNSignal:
                 "min_confidence": self.min_confidence,
                 "training_samples": self.training_samples,
                 "feature_count": self.feature_count,
+                "feature_version": FEATURE_VERSION,
             }, f)
-        logger.info(f"k-NN model saved to {path} ({self.feature_count} features)")
+        logger.info(f"k-NN model saved to {path} ({self.feature_count} features, v{FEATURE_VERSION})")
 
     def load(self, path: Path | str) -> bool:
         """Load a previously fitted model from disk.
 
         Returns False if the model was trained with a different feature count
-        (e.g. old 10-feature model), forcing a retrain.
+        or feature version, forcing a retrain.
         """
         path = Path(path)
         if not path.exists():
@@ -454,10 +578,19 @@ class KNNSignal:
                 data = pickle.load(f)
 
             saved_features = data.get("feature_count", 10)
+            saved_version = data.get("feature_version", 1)
+
             if saved_features != FeatureCalculator.FEATURE_COUNT:
                 logger.warning(
                     f"Model feature count mismatch: saved={saved_features}, "
                     f"expected={FeatureCalculator.FEATURE_COUNT}. Retrain required."
+                )
+                return False
+
+            if saved_version != FEATURE_VERSION:
+                logger.warning(
+                    f"Model feature version mismatch: saved=v{saved_version}, "
+                    f"expected=v{FEATURE_VERSION}. Retrain required."
                 )
                 return False
 
@@ -467,20 +600,24 @@ class KNNSignal:
             self.min_confidence = data["min_confidence"]
             self.training_samples = data.get("training_samples", 0)
             self.feature_count = saved_features
+            self.feature_version = saved_version
             self.is_fitted = True
-            logger.info(f"k-NN model loaded from {path} ({self.training_samples} samples, {self.feature_count} features)")
+            logger.info(f"k-NN model loaded from {path} ({self.training_samples} samples, {self.feature_count} features, v{self.feature_version})")
             return True
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             return False
 
     def get_similar_days(
-        self, bars: list[dict], n: int = 5, vix_by_date: dict[str, float] | None = None,
+        self,
+        bars: list[dict],
+        n: int = 5,
+        vix_by_date: dict[str, float] | None = None,
+        cross_asset_bars: dict[str, list[dict]] | None = None,
+        microstructure_by_date: dict[str, dict[str, float]] | None = None,
     ) -> list[dict]:
         """
         Find the N most similar historical days to the current day.
-
-        Useful for Telegram reporting — shows what happened on similar days.
 
         Returns:
             List of dicts with {date, distance, next_day_return}
@@ -489,7 +626,7 @@ class KNNSignal:
             return []
 
         calc = FeatureCalculator()
-        features = calc.compute_features(bars, len(bars) - 1, vix_by_date=vix_by_date)
+        features = calc.compute_features(bars, len(bars) - 1, vix_by_date=vix_by_date, cross_asset_bars=cross_asset_bars, microstructure_by_date=microstructure_by_date)
         if features is None:
             return []
 

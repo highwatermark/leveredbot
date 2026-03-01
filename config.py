@@ -49,7 +49,7 @@ LEVERAGE_CONFIG = {
     "sma_deadzone_pct": 0.05,       # 5% band around SMA to reduce whipsaws (was 2%)
 
     # Historical Data
-    "history_calendar_days": 400,   # ~280 trading days, enough for 250-bar SMA
+    "history_calendar_days": 800,   # ~560 trading days, enough for 250-bar SMA + k-NN training (needs 400+)
 
     # Momentum / Rate of Change
     "roc_period": 20,
@@ -95,13 +95,23 @@ LEVERAGE_CONFIG = {
     "use_binary_mode": True,          # Eliminate CAUTIOUS regime (maps to BULL)
     "rsi_overbought_threshold": 70,   # RSI-14 above this blocks new buys
 
-    # k-NN signal overlay
-    "use_knn_signal": True,           # Enable k-NN prediction
+    # Prediction model overlay
+    "prediction_model": "knn",        # "knn", "xgb", or "both"
+    "use_knn_signal": True,           # Enable prediction model
     "knn_report_only": True,          # Report-only mode (no sizing impact)
     "knn_neighbors": 7,               # k in k-NN
     "knn_min_confidence": 0.55,       # Below this → FLAT signal
     "knn_disagreement_confidence": 0.60,  # k-NN SHORT + regime BULL at this confidence → gate blocks
     "knn_model_path": "data/knn_model.pkl",
+    # XGBoost hyperparameters
+    "xgb_n_estimators": 200,
+    "xgb_max_depth": 4,
+    "xgb_learning_rate": 0.05,
+    "xgb_min_confidence": 0.55,
+    "xgb_model_path": "data/xgb_model.pkl",
+
+    # Combined UW flow (TQQQ + SQQQ)
+    "use_combined_flow": True,
 
     # SQQQ (inverse) trading
     "use_sqqq_trading": False,            # Enable SQQQ entries on k-NN SHORT signals

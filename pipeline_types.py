@@ -25,6 +25,10 @@ class MarketData:
     # SQQQ data (optional, only when use_sqqq_trading enabled)
     sqqq_position: dict | None = None
     sqqq_price: float | None = None
+    # Cross-asset bars for k-NN/XGBoost features (TLT, GLD, IWM)
+    cross_asset_bars: dict[str, list[dict]] = field(default_factory=dict)
+    # Microstructure features by date (intraday-derived)
+    microstructure_by_date: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass

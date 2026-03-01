@@ -1,9 +1,8 @@
 """
-Unusual Whales API wrapper for TQQQ options flow sentiment.
+Unusual Whales API wrapper for options flow sentiment.
 
 Best-effort: if UW API is unavailable, returns neutral sentiment.
-TQQQ has ~70+ flow alerts per day — we aggregate put vs call premium
-to gauge institutional sentiment as a secondary overlay.
+Supports TQQQ (bull), SQQQ (bear), and combined flow analysis.
 """
 
 import logging
@@ -20,11 +19,24 @@ UW_BASE_URL = "https://api.unusualwhales.com"
 TIMEOUT = 15  # seconds
 
 
-def get_tqqq_flow(lookback_hours: int | None = None) -> dict:
-    """
-    Get TQQQ options flow sentiment.
+def _neutral_result(error: str | None = None) -> dict:
+    """Return a neutral sentiment dict."""
+    return {
+        "put_premium": 0,
+        "call_premium": 0,
+        "ratio": 1.0,
+        "is_bearish": False,
+        "adjustment_factor": 1.0,
+        "alert_count": 0,
+        "error": error,
+    }
 
-    Queries UW flow alerts for TQQQ over the lookback period,
+
+def _get_flow_for_symbol(symbol: str, lookback_hours: int | None = None) -> dict:
+    """
+    Get options flow sentiment for a single symbol.
+
+    Queries UW flow alerts over the lookback period,
     sums put and call premiums, and returns aggregated data.
 
     Returns:
@@ -41,19 +53,8 @@ def get_tqqq_flow(lookback_hours: int | None = None) -> dict:
     if lookback_hours is None:
         lookback_hours = LEVERAGE_CONFIG["options_flow_lookback_hours"]
 
-    neutral = {
-        "put_premium": 0,
-        "call_premium": 0,
-        "ratio": 1.0,
-        "is_bearish": False,
-        "adjustment_factor": 1.0,
-        "alert_count": 0,
-        "error": None,
-    }
-
     if not UW_API_KEY:
-        neutral["error"] = "No UW API key configured"
-        return neutral
+        return _neutral_result("No UW API key configured")
 
     try:
         headers = {
@@ -63,7 +64,7 @@ def get_tqqq_flow(lookback_hours: int | None = None) -> dict:
 
         with httpx.Client(timeout=TIMEOUT) as client:
             resp = client.get(
-                f"{UW_BASE_URL}/api/stock/{LEVERAGE_CONFIG['bull_etf']}/flow-alerts",
+                f"{UW_BASE_URL}/api/stock/{symbol}/flow-alerts",
                 headers=headers,
             )
             resp.raise_for_status()
@@ -71,8 +72,7 @@ def get_tqqq_flow(lookback_hours: int | None = None) -> dict:
 
         alerts = data.get("data", [])
         if not alerts:
-            neutral["error"] = "No flow alerts returned"
-            return neutral
+            return _neutral_result(f"No flow alerts returned for {symbol}")
 
         # Filter to lookback window (use UTC for consistent comparison with API timestamps)
         cutoff = datetime.now(pytz.UTC) - timedelta(hours=lookback_hours)
@@ -127,6 +127,77 @@ def get_tqqq_flow(lookback_hours: int | None = None) -> dict:
         }
 
     except Exception as e:
-        logger.warning(f"UW API error (non-fatal): {e}")
-        neutral["error"] = str(e)
-        return neutral
+        logger.warning(f"UW API error for {symbol} (non-fatal): {e}")
+        return _neutral_result(str(e))
+
+
+def get_tqqq_flow(lookback_hours: int | None = None) -> dict:
+    """Get TQQQ (bull ETF) options flow sentiment."""
+    return _get_flow_for_symbol(LEVERAGE_CONFIG["bull_etf"], lookback_hours)
+
+
+def get_sqqq_flow(lookback_hours: int | None = None) -> dict:
+    """Get SQQQ (bear ETF) options flow sentiment."""
+    return _get_flow_for_symbol(LEVERAGE_CONFIG["bear_etf"], lookback_hours)
+
+
+def get_combined_flow(lookback_hours: int | None = None) -> dict:
+    """
+    Get combined TQQQ+SQQQ flow sentiment.
+
+    Logic:
+      bullish = tqqq_call_premium + sqqq_put_premium
+      bearish = tqqq_put_premium + sqqq_call_premium
+      combined_ratio = bearish / bullish
+
+    Returns backward-compatible keys so check_options_flow() works unchanged.
+    Falls back to TQQQ-only if SQQQ fetch fails.
+    """
+    tqqq = get_tqqq_flow(lookback_hours)
+
+    try:
+        sqqq = get_sqqq_flow(lookback_hours)
+    except Exception as e:
+        logger.warning(f"SQQQ flow fetch failed, using TQQQ-only: {e}")
+        return tqqq
+
+    if sqqq.get("error") and tqqq.get("error"):
+        # Both failed — return neutral
+        return _neutral_result("Both TQQQ and SQQQ flow fetch failed")
+
+    if sqqq.get("error"):
+        # SQQQ failed — fall back to TQQQ only
+        return tqqq
+
+    # Combined sentiment:
+    # Bullish signals = people buying TQQQ calls + buying SQQQ puts (betting on up)
+    # Bearish signals = people buying TQQQ puts + buying SQQQ calls (betting on down)
+    bullish_premium = tqqq.get("call_premium", 0) + sqqq.get("put_premium", 0)
+    bearish_premium = tqqq.get("put_premium", 0) + sqqq.get("call_premium", 0)
+
+    if bullish_premium > 0:
+        combined_ratio = bearish_premium / bullish_premium
+    elif bearish_premium > 0:
+        combined_ratio = 10.0
+    else:
+        combined_ratio = 1.0
+
+    bearish_threshold = LEVERAGE_CONFIG["options_flow_bearish_ratio"]
+    is_bearish = combined_ratio > bearish_threshold
+    reduction = LEVERAGE_CONFIG["options_flow_reduction_pct"]
+    adjustment = 1.0 - reduction if is_bearish else 1.0
+
+    total_alerts = tqqq.get("alert_count", 0) + sqqq.get("alert_count", 0)
+
+    return {
+        "put_premium": tqqq.get("put_premium", 0) + sqqq.get("call_premium", 0),  # bearish side
+        "call_premium": tqqq.get("call_premium", 0) + sqqq.get("put_premium", 0),  # bullish side
+        "ratio": round(combined_ratio, 2),
+        "is_bearish": is_bearish,
+        "adjustment_factor": adjustment,
+        "alert_count": total_alerts,
+        "error": None,
+        "source": "combined",
+        "tqqq_ratio": tqqq.get("ratio", 1.0),
+        "sqqq_ratio": sqqq.get("ratio", 1.0),
+    }

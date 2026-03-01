@@ -19,7 +19,7 @@ from alpaca.trading.requests import MarketOrderRequest, GetCalendarRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, LEVERAGE_CONFIG
 
@@ -186,6 +186,45 @@ def get_bars(symbol: str, start: str, end: str) -> list[dict]:
             })
         return result
     return _retry(_call, f"get_bars({symbol})")
+
+
+def get_intraday_bars(symbol: str, start: str, end: str, timeframe_minutes: int = 5) -> list[dict]:
+    """
+    Get historical intraday bars at minute-level resolution.
+
+    Args:
+        symbol: e.g. "QQQ"
+        start: ISO date string e.g. "2025-01-01"
+        end: ISO date string e.g. "2025-01-31"
+        timeframe_minutes: bar size in minutes (default 5)
+
+    Returns:
+        List of dicts with date, timestamp, open, high, low, close, volume, vwap
+    """
+    def _call():
+        client = _get_data_client()
+        request = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame(timeframe_minutes, TimeFrameUnit.Minute),
+            start=datetime.fromisoformat(start),
+            end=datetime.fromisoformat(end),
+        )
+        bars = client.get_stock_bars(request)
+        result = []
+        bar_set = bars.data.get(symbol, [])
+        for bar in bar_set:
+            result.append({
+                "date": bar.timestamp.date().isoformat(),
+                "timestamp": bar.timestamp.isoformat(),
+                "open": float(bar.open),
+                "high": float(bar.high),
+                "low": float(bar.low),
+                "close": float(bar.close),
+                "volume": int(bar.volume),
+                "vwap": float(bar.vwap) if hasattr(bar, "vwap") and bar.vwap else float(bar.close),
+            })
+        return result
+    return _retry(_call, f"get_intraday_bars({symbol})")
 
 
 def fetch_bars_for_cache(symbol: str, start: str, end: str) -> list[dict]:

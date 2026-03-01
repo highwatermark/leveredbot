@@ -43,6 +43,18 @@ def _timestamp() -> str:
     return datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+def _calc_day_trades_remaining(account: dict) -> int:
+    """Convert Alpaca's daytrade_count (trades USED) to trades REMAINING.
+
+    PDT accounts with equity >= $25K have unlimited day trades.
+    Non-PDT accounts get 3 day trades per rolling 5 business days.
+    """
+    if account.get("pattern_day_trader") and account.get("equity", 0) >= 25_000:
+        return 999  # Unlimited for PDT accounts above $25K
+    used = account.get("daytrade_count", 0)
+    return max(0, 3 - used)
+
+
 def _fetch_all_data(use_cache: bool = True, conn=None) -> "MarketData":
     """Fetch all market data needed for the strategy."""
     from concurrent.futures import ThreadPoolExecutor
@@ -96,6 +108,29 @@ def _fetch_all_data(use_cache: bool = True, conn=None) -> "MarketData":
         end = datetime.now(ET).date().isoformat()
         qqq_bars = alpaca_client.get_bars(LEVERAGE_CONFIG["underlying"], start, end)
 
+    # Cross-asset bars for k-NN/XGBoost features (TLT, GLD, IWM)
+    cross_asset_bars = {}
+    if LEVERAGE_CONFIG.get("use_knn_signal", False) and use_cache:
+        for sym in ("TLT", "GLD", "IWM"):
+            try:
+                cross_asset_bars[sym] = get_bars_with_cache(
+                    sym, cal_days, alpaca_client.fetch_bars_for_cache, conn
+                )
+            except Exception as e:
+                logger.warning(f"Cross-asset bar fetch failed for {sym}: {e}")
+
+    # Microstructure features (intraday-derived, cached)
+    microstructure_by_date = {}
+    if LEVERAGE_CONFIG.get("use_knn_signal", False) and use_cache:
+        try:
+            from db.cache import get_microstructure_with_cache
+            microstructure_by_date = get_microstructure_with_cache(
+                LEVERAGE_CONFIG["underlying"], cal_days,
+                alpaca_client.get_intraday_bars, conn
+            )
+        except Exception as e:
+            logger.warning(f"Microstructure fetch failed: {e}")
+
     qqq_closes = [b["close"] for b in qqq_bars]
 
     # TQQQ price from snapshot or position
@@ -145,6 +180,8 @@ def _fetch_all_data(use_cache: bool = True, conn=None) -> "MarketData":
         trading_days_fetched=len(qqq_bars),
         sqqq_position=sqqq_pos,
         sqqq_price=sqqq_price,
+        cross_asset_bars=cross_asset_bars,
+        microstructure_by_date=microstructure_by_date,
     )
 
 
@@ -176,7 +213,10 @@ def _compute_signals(data: "MarketData", conn=None) -> "StrategySignals":
     vol_adj = get_vol_adjustment(vol_regime)
 
     # Options flow
-    flow = uw_client.get_tqqq_flow()
+    if LEVERAGE_CONFIG.get("use_combined_flow", False):
+        flow = uw_client.get_combined_flow()
+    else:
+        flow = uw_client.get_tqqq_flow()
     is_bearish, flow_adj = check_options_flow(flow)
 
     # Strategy state (batched: regime + duration + losing days)
@@ -209,12 +249,12 @@ def _compute_signals(data: "MarketData", conn=None) -> "StrategySignals":
 
     if LEVERAGE_CONFIG.get("use_knn_signal", False):
         try:
-            from strategy.knn_signal import KNNSignal
             from strategy.vix_data import get_vix_data
             from pathlib import Path
 
-            model_path = Path(__file__).parent / LEVERAGE_CONFIG.get("knn_model_path", "data/knn_model.pkl")
-            knn = KNNSignal()
+            prediction_model = LEVERAGE_CONFIG.get("prediction_model", "knn")
+            cross_bars = data.cross_asset_bars
+            micro_data = data.microstructure_by_date
 
             # Fetch VIX data (cached, append-only)
             vix_by_date = {}
@@ -223,23 +263,49 @@ def _compute_signals(data: "MarketData", conn=None) -> "StrategySignals":
             except Exception as e:
                 logger.warning(f"VIX data fetch failed, using defaults: {e}")
 
-            # Try loading cached model first, else train from bars
-            loaded = False
-            if model_path.exists():
-                loaded = knn.load(model_path)
-            if not loaded and len(data.qqq_bars) >= 400:
-                knn.fit_from_bars(data.qqq_bars, vix_by_date=vix_by_date)
-                knn.save(model_path)
+            # Run k-NN if selected
+            if prediction_model in ("knn", "both"):
+                from strategy.knn_signal import KNNSignal
+                knn_model_path = Path(__file__).parent / LEVERAGE_CONFIG.get("knn_model_path", "data/knn_model.pkl")
+                knn = KNNSignal()
+                loaded = False
+                if knn_model_path.exists():
+                    loaded = knn.load(knn_model_path)
+                if not loaded and len(data.qqq_bars) >= 400:
+                    knn.fit_from_bars(data.qqq_bars, vix_by_date=vix_by_date, cross_asset_bars=cross_bars, microstructure_by_date=micro_data)
+                    knn.save(knn_model_path)
+                if knn.is_fitted:
+                    knn_result = knn.predict(data.qqq_bars, vix_by_date=vix_by_date, cross_asset_bars=cross_bars, microstructure_by_date=micro_data)
+                    if prediction_model == "knn" or prediction_model == "both":
+                        knn_direction = knn_result["direction"]
+                        knn_confidence = knn_result["confidence"]
+                        knn_adjustment = knn_result["adjustment"]
+                        knn_probabilities = knn_result["probabilities"]
+                    logger.info(f"k-NN: {knn_result['direction']} (conf={knn_result['confidence']:.2f}, adj={knn_result['adjustment']})")
 
-            if knn.is_fitted:
-                knn_result = knn.predict(data.qqq_bars, vix_by_date=vix_by_date)
-                knn_direction = knn_result["direction"]
-                knn_confidence = knn_result["confidence"]
-                knn_adjustment = knn_result["adjustment"]
-                knn_probabilities = knn_result["probabilities"]
-                logger.info(f"k-NN: {knn_direction} (conf={knn_confidence:.2f}, adj={knn_adjustment})")
+            # Run XGBoost if selected
+            if prediction_model in ("xgb", "both"):
+                from strategy.xgb_signal import XGBSignal
+                xgb_model_path = Path(__file__).parent / LEVERAGE_CONFIG.get("xgb_model_path", "data/xgb_model.pkl")
+                xgb = XGBSignal()
+                loaded = False
+                if xgb_model_path.exists():
+                    loaded = xgb.load(xgb_model_path)
+                if not loaded and len(data.qqq_bars) >= 400:
+                    xgb.fit_from_bars(data.qqq_bars, vix_by_date=vix_by_date, cross_asset_bars=cross_bars, microstructure_by_date=micro_data)
+                    xgb.save(xgb_model_path)
+                if xgb.is_fitted:
+                    xgb_result = xgb.predict(data.qqq_bars, vix_by_date=vix_by_date, cross_asset_bars=cross_bars, microstructure_by_date=micro_data)
+                    # When "xgb" is primary, use its result for sizing
+                    if prediction_model == "xgb":
+                        knn_direction = xgb_result["direction"]
+                        knn_confidence = xgb_result["confidence"]
+                        knn_adjustment = xgb_result["adjustment"]
+                        knn_probabilities = xgb_result["probabilities"]
+                    logger.info(f"XGBoost: {xgb_result['direction']} (conf={xgb_result['confidence']:.2f}, adj={xgb_result['adjustment']})")
+
         except Exception as e:
-            logger.warning(f"k-NN signal failed, using neutral: {e}")
+            logger.warning(f"Prediction model signal failed, using neutral: {e}")
 
     return StrategySignals(
         qqq_close=qqq_close,
@@ -268,7 +334,7 @@ def _compute_signals(data: "MarketData", conn=None) -> "StrategySignals":
         daily_loss_pct=data.daily_loss_pct,
         qqq_closes=closes,
         trading_days_fetched=data.trading_days_fetched,
-        day_trades_remaining=account["daytrade_count"],
+        day_trades_remaining=_calc_day_trades_remaining(account),
         account_equity=account["equity"],
         cash_balance=account["cash"],
         consecutive_losing_days=state["consecutive_losing_days"],
@@ -1244,19 +1310,35 @@ def cmd_backtest():
         "disagree_knn_right": 0, "disagree_knn_wrong": 0,
     }
 
-    # Fetch VIX data for k-NN features
+    # Fetch VIX data, cross-asset bars, and microstructure for k-NN/XGBoost features
     vix_by_date = {}
+    cross_asset_bars = {}
+    microstructure_by_date = {}
     if LEVERAGE_CONFIG.get("use_knn_signal", False):
         try:
             from strategy.vix_data import get_vix_data
             vix_by_date = get_vix_data()
         except Exception as e:
             logger.warning(f"VIX data fetch failed for backtest, using defaults: {e}")
+        for sym in ("TLT", "GLD", "IWM"):
+            try:
+                cross_asset_bars[sym] = get_bars_with_cache(
+                    sym, 900, alpaca_client.fetch_bars_for_cache, conn
+                )
+            except Exception as e:
+                logger.warning(f"Cross-asset bar fetch failed for {sym}: {e}")
+        try:
+            from db.cache import get_microstructure_with_cache
+            microstructure_by_date = get_microstructure_with_cache(
+                "QQQ", 900, alpaca_client.get_intraday_bars, conn
+            )
+        except Exception as e:
+            logger.warning(f"Microstructure fetch failed for backtest: {e}")
 
     if LEVERAGE_CONFIG.get("use_knn_signal", False) and len(knn_bars) > knn_train_cutoff + 50:
         from strategy.knn_signal import KNNSignal, FeatureCalculator
         knn_model = KNNSignal(n_neighbors=LEVERAGE_CONFIG.get("knn_neighbors", 7))
-        if not knn_model.fit_from_bars(knn_bars[:knn_train_cutoff + 1], vix_by_date=vix_by_date):
+        if not knn_model.fit_from_bars(knn_bars[:knn_train_cutoff + 1], vix_by_date=vix_by_date, cross_asset_bars=cross_asset_bars, microstructure_by_date=microstructure_by_date):
             logger.warning("k-NN training failed for backtest validation")
             knn_model = None
         else:
@@ -1310,7 +1392,7 @@ def cmd_backtest():
 
         # k-NN validation: predict and compare against actual next-day return
         if knn_model is not None and i >= knn_train_cutoff and i + 1 < len(common_dates):
-            features = FeatureCalculator.compute_features(knn_bars, i, vix_by_date=vix_by_date)
+            features = FeatureCalculator.compute_features(knn_bars, i, vix_by_date=vix_by_date, cross_asset_bars=cross_asset_bars, microstructure_by_date=microstructure_by_date)
             if features is not None:
                 X_scaled = knn_model.scaler.transform(features.reshape(1, -1))
                 probs = knn_model.model.predict_proba(X_scaled)[0]
