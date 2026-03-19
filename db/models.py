@@ -388,6 +388,29 @@ def get_consecutive_losing_days(conn: sqlite3.Connection | None = None) -> int:
         return count
 
 
+def get_consecutive_gate_failures(conn: sqlite3.Connection | None = None) -> int:
+    """Count consecutive days where gates failed while holding a TQQQ position.
+
+    Looks at recent TQQQ decisions (most recent first). Counts streak of
+    gates_passed=0 AND current_shares>0. Stops at the first day where gates
+    passed or no position was held.
+    """
+    with get_db(conn) as c:
+        rows = c.execute(
+            "SELECT gates_passed, current_shares FROM decisions "
+            "WHERE symbol = 'TQQQ' ORDER BY id DESC LIMIT 30"
+        ).fetchall()
+        count = 0
+        for row in rows:
+            if (row["gates_passed"] == 0
+                    and row["current_shares"] is not None
+                    and row["current_shares"] > 0):
+                count += 1
+            else:
+                break
+        return count
+
+
 def get_strategy_state(conn: sqlite3.Connection | None = None) -> dict:
     """Get regime, duration, and losing days in a single DB pass.
 

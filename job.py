@@ -416,7 +416,7 @@ def _build_sizing_data(signals: "StrategySignals") -> dict:
     }
 
 
-def _build_sqqq_gate_data(signals: "StrategySignals", is_half_day: bool = False) -> dict:
+def _build_sqqq_gate_data(signals: "StrategySignals", is_half_day: bool = False, tqqq_just_exited: bool = False) -> dict:
     """Build the SQQQ gate checklist input dict from computed signals."""
     return {
         "knn_direction": signals.knn_direction,
@@ -428,6 +428,7 @@ def _build_sqqq_gate_data(signals: "StrategySignals", is_half_day: bool = False)
         "trading_days_fetched": signals.trading_days_fetched,
         "has_tqqq_position": signals.has_tqqq_position,
         "regime": signals.effective_regime,
+        "tqqq_just_exited": tqqq_just_exited,
     }
 
 
@@ -754,12 +755,12 @@ def _already_traded_today(conn=None, symbol: str | None = None) -> bool:
     with get_db(conn) as c:
         if symbol:
             row = c.execute(
-                "SELECT COUNT(*) as cnt FROM decisions WHERE date = ? AND order_action IN ('BUY', 'SELL') AND symbol = ?",
+                "SELECT COUNT(*) as cnt FROM decisions WHERE date = ? AND status = 'EXECUTED' AND symbol = ?",
                 [today_str, symbol],
             ).fetchone()
         else:
             row = c.execute(
-                "SELECT COUNT(*) as cnt FROM decisions WHERE date = ? AND order_action IN ('BUY', 'SELL')",
+                "SELECT COUNT(*) as cnt FROM decisions WHERE date = ? AND status = 'EXECUTED'",
                 [today_str],
             ).fetchone()
         return row["cnt"] > 0 if row else False
@@ -860,10 +861,50 @@ def cmd_run(halfday_check: bool = False):
 
         # Execute
         is_emergency = signals.effective_regime in ("RISK_OFF", "BREAKDOWN")
-        should_trade = gates_passed or is_emergency
+        is_exit_or_reduction = target["action"] in ("EXIT", "SELL")
+        should_trade = gates_passed or is_emergency or is_exit_or_reduction
 
-        # Dedup: skip if we already traded today (prevents halfday + main run double-buy)
-        if should_trade and not is_emergency and _already_traded_today(conn):
+        # Stale position force-exit: if gates have failed for N consecutive days while holding
+        stale_max = LEVERAGE_CONFIG.get("stale_position_max_days", 5)
+        if (not should_trade
+                and signals.current_shares > 0
+                and not is_emergency):
+            from db.models import get_consecutive_gate_failures
+            consecutive_failures = get_consecutive_gate_failures(conn)
+            if consecutive_failures >= stale_max:
+                logger.warning(
+                    f"STALE POSITION: gates failed {consecutive_failures} consecutive days "
+                    f"while holding {signals.current_shares} shares. Forcing exit."
+                )
+                is_emergency = True
+                should_trade = True
+                target["action"] = "EXIT"
+                target["target_shares"] = 0
+                target["delta_shares"] = -signals.current_shares
+                target["delta_value"] = -signals.current_shares * signals.tqqq_price
+
+        # Rotation detection: TQQQ → SQQQ when k-NN says SHORT with high confidence
+        wants_rotation_to_sqqq = (
+            LEVERAGE_CONFIG.get("use_sqqq_trading", False)
+            and signals.has_tqqq_position
+            and signals.knn_direction == "SHORT"
+            and signals.knn_confidence >= LEVERAGE_CONFIG.get("sqqq_min_knn_confidence", 0.60)
+            and signals.effective_regime not in ("RISK_OFF", "BREAKDOWN")
+        )
+        if wants_rotation_to_sqqq:
+            logger.info(f"ROTATION: k-NN SHORT (conf={signals.knn_confidence:.2f}) — "
+                         f"will exit TQQQ to rotate to SQQQ")
+            should_trade = True
+            target["action"] = "EXIT"
+            target["target_shares"] = 0
+            target["delta_shares"] = -signals.current_shares
+            target["delta_value"] = -signals.current_shares * signals.tqqq_price
+
+        # Dedup: skip if we already executed a buy today (prevents halfday + main run double-buy)
+        # Only dedup buys — sells/exits should always go through
+        if (should_trade and not is_emergency and not is_exit_or_reduction
+                and not wants_rotation_to_sqqq
+                and target["action"] == "BUY" and _already_traded_today(conn)):
             logger.info("Already traded today, skipping execution (dedup)")
             should_trade = False
 
@@ -933,12 +974,14 @@ def cmd_run(halfday_check: bool = False):
 
         if will_trade:
             try:
+                # Sells/exits bypass PDT — selling shares bought on a prior day isn't a day trade
+                is_selling = target["action"] in ("EXIT", "SELL")
                 execution_result = execute_rebalance(
                     target["target_shares"],
                     signals.current_shares,
                     signals.tqqq_price,
                     alpaca_client,
-                    is_emergency=is_emergency,
+                    is_emergency=is_emergency or is_selling,
                     day_trades_remaining=signals.day_trades_remaining,
                 )
                 logger.info(f"Execution: {execution_result['reason']}")
@@ -963,8 +1006,16 @@ def cmd_run(halfday_check: bool = False):
         sqqq_order_shares = 0
         sqqq_execution_result = {"executed": False, "action": "HOLD"}
 
+        # Track if TQQQ was just exited (for rotation)
+        tqqq_just_exited = (
+            wants_rotation_to_sqqq
+            and execution_result.get("executed", False)
+        )
+
         if LEVERAGE_CONFIG.get("use_sqqq_trading", False):
-            sqqq_gates_passed, sqqq_gates_failed = run_sqqq_gate_checklist(_build_sqqq_gate_data(signals, data.is_half_day))
+            # Pass tqqq_just_exited so Gate S8 (mutual_exclusivity) is bypassed after rotation
+            sqqq_gate_data = _build_sqqq_gate_data(signals, data.is_half_day, tqqq_just_exited=tqqq_just_exited)
+            sqqq_gates_passed, sqqq_gates_failed = run_sqqq_gate_checklist(sqqq_gate_data)
             sqqq_target = calculate_sqqq_target_shares(_build_sqqq_sizing_data(signals))
             logger.info(f"SQQQ gates: {'PASS' if sqqq_gates_passed else 'FAIL'} ({sqqq_gates_failed})")
             logger.info(f"SQQQ target: {sqqq_target['target_shares']} shares ({sqqq_target['action']})")
@@ -990,16 +1041,20 @@ def cmd_run(halfday_check: bool = False):
                     logger.info(f"SQQQ exit: {sqqq_execution_result['reason']}")
 
             # Phase 2: SQQQ ENTRY (runs last, after TQQQ execution)
-            # Enter if: gates pass AND no TQQQ position AND not entering TQQQ this cycle
+            # Enter if: gates pass AND (no TQQQ position OR just exited TQQQ for rotation)
             elif (sqqq_gates_passed
-                  and not signals.has_tqqq_position
+                  and (not signals.has_tqqq_position or tqqq_just_exited)
                   and not (will_trade and target["action"] == "BUY")
                   and sqqq_target["action"] == "BUY"
                   and not _already_traded_today(conn, symbol="SQQQ")):
+                # Decrement day trades remaining after TQQQ exit used one
+                sqqq_day_trades = signals.day_trades_remaining
+                if tqqq_just_exited:
+                    sqqq_day_trades = max(0, sqqq_day_trades - 1)
                 logger.info("Entering SQQQ position")
                 sqqq_execution_result = execute_rebalance(
                     sqqq_target["target_shares"], 0, signals.sqqq_price,
-                    alpaca_client, day_trades_remaining=signals.day_trades_remaining,
+                    alpaca_client, day_trades_remaining=sqqq_day_trades,
                     symbol="SQQQ",
                 )
                 sqqq_action = sqqq_target["action"]

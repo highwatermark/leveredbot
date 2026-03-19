@@ -203,6 +203,57 @@ class TestCalculateSqqqTargetShares:
             assert result["target_shares"] == 600
 
 
+class TestSqqqGateRotationBypass:
+    """Test that Gate S8 (mutual_exclusivity) is bypassed during TQQQ→SQQQ rotation."""
+
+    def _make_gate_data(self, **overrides):
+        data = {
+            "knn_direction": "SHORT",
+            "knn_confidence": 0.70,
+            "vol_regime": "NORMAL",
+            "allocated_capital": 30000,
+            "is_execution_window": True,
+            "day_trades_remaining": 5,
+            "trading_days_fetched": 278,
+            "has_tqqq_position": True,
+            "regime": "BULL",
+            "tqqq_just_exited": False,
+        }
+        data.update(overrides)
+        return data
+
+    def test_gate_s8_blocks_without_rotation(self):
+        """Without rotation flag, Gate S8 still blocks when holding TQQQ."""
+        data = self._make_gate_data(has_tqqq_position=True, tqqq_just_exited=False)
+        passed, failed = run_sqqq_gate_checklist(data)
+        assert "mutual_exclusivity" in failed
+
+    def test_gate_s8_bypassed_on_rotation(self):
+        """With tqqq_just_exited=True, Gate S8 is bypassed."""
+        data = self._make_gate_data(has_tqqq_position=True, tqqq_just_exited=True)
+        passed, failed = run_sqqq_gate_checklist(data)
+        assert "mutual_exclusivity" not in failed
+        assert passed is True
+
+    def test_gate_s8_bypassed_but_other_gates_still_checked(self):
+        """Rotation bypass only affects S8, other gates still enforced."""
+        data = self._make_gate_data(
+            has_tqqq_position=True,
+            tqqq_just_exited=True,
+            knn_confidence=0.50,  # Below threshold
+        )
+        passed, failed = run_sqqq_gate_checklist(data)
+        assert "mutual_exclusivity" not in failed
+        assert "knn_confidence" in failed
+        assert passed is False
+
+    def test_no_tqqq_position_no_flag_needed(self):
+        """When not holding TQQQ, rotation flag is irrelevant."""
+        data = self._make_gate_data(has_tqqq_position=False, tqqq_just_exited=False)
+        passed, failed = run_sqqq_gate_checklist(data)
+        assert "mutual_exclusivity" not in failed
+
+
 class TestCapitalAllocationWithSqqq:
     def test_sqqq_not_counted_as_other(self):
         """SQQQ position should not be counted as 'other' — it's strategy capital."""

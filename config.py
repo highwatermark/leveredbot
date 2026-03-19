@@ -121,6 +121,9 @@ LEVERAGE_CONFIG = {
     "sqqq_min_knn_confidence": 0.60,      # Minimum k-NN confidence for SQQQ entry
     "sqqq_max_position_pct": 0.40,        # Max 40% of allocated capital in SQQQ
 
+    # Stale position protection
+    "stale_position_max_days": 5,       # Force exit after N consecutive gate-fail days while holding
+
     # Position Manager — windowed intraday management
     "pm_enabled": True,
     "pm_stop_loss_pct": 0.08,               # 8% hard stop from entry

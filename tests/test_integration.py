@@ -249,3 +249,147 @@ class TestCmdRunIntegration:
             assert row["cnt"] == 0
         finally:
             conn.close()
+
+
+class TestSellsBypassGates:
+    """Verify that sells/exits execute even when entry gates fail."""
+
+    @patch("notifications._send_message", return_value=True)
+    @patch("notifications.send_regime_alert", return_value=True)
+    def test_sell_executes_when_gates_fail(self, mock_regime_alert, mock_send, tmp_path):
+        """When holding TQQQ and gates fail with target < current, sell should execute."""
+        db_path, db_factory = _make_test_db(tmp_path)
+
+        # Use flat/sideways closes so momentum gate fails
+        np.random.seed(42)
+        flat_closes = [500.0]
+        for _ in range(310):
+            flat_closes.append(flat_closes[-1] * (1 + np.random.normal(0.0, 0.005)))
+        flat_bars = _make_bars_from_closes(flat_closes)
+
+        flat_snapshot = {
+            "QQQ": {
+                "latest_trade_price": flat_closes[-1],
+                "latest_trade_time": "2025-01-15T15:45:00-05:00",
+                "daily_bar_close": flat_closes[-1],
+                "daily_bar_open": flat_closes[-1] * 0.999,
+                "daily_bar_high": flat_closes[-1] * 1.002,
+                "daily_bar_low": flat_closes[-1] * 0.998,
+                "daily_bar_volume": 45000000,
+                "prev_daily_bar_close": flat_closes[-2],
+            },
+            "TQQQ": MOCK_SNAPSHOT["TQQQ"],
+        }
+
+        positions_with_tqqq = [
+            {"symbol": "TQQQ", "qty": 200, "market_value": 10128.0,
+             "avg_entry_price": 48.0, "current_price": 50.64,
+             "unrealized_pl": 528.0, "unrealized_plpc": 0.055},
+        ]
+
+        sell_order = {
+            "order_id": "test-sell-123",
+            "status": "filled",
+            "symbol": "TQQQ",
+            "qty": 100,
+            "side": "sell",
+            "filled_avg_price": 50.64,
+            "filled_qty": 100,
+        }
+
+        with patch("db.models.get_connection", side_effect=db_factory), \
+             patch("alpaca_client.get_account", return_value=MOCK_ACCOUNT), \
+             patch("alpaca_client.get_positions", return_value=positions_with_tqqq), \
+             patch("alpaca_client.get_calendar", return_value=MOCK_CALENDAR), \
+             patch("alpaca_client.get_snapshot", return_value=flat_snapshot), \
+             patch("alpaca_client.submit_market_order", return_value=sell_order) as mock_order, \
+             patch("db.cache.get_bars_with_cache", return_value=flat_bars), \
+             patch("uw_client.get_combined_flow", return_value=MOCK_FLOW), \
+             patch("uw_client.get_tqqq_flow", return_value=MOCK_FLOW):
+
+            import job
+            job.cmd_run(halfday_check=False)
+
+        conn = _read_db(db_path)
+        try:
+            row = conn.execute(
+                "SELECT * FROM decisions WHERE symbol='TQQQ' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            assert row is not None
+            # If sizing computed a sell (target < current), the sell should have executed
+            if row["target_shares"] < row["current_shares"]:
+                assert row["status"] == "EXECUTED", (
+                    f"Sell should execute even with failed gates. "
+                    f"target={row['target_shares']}, current={row['current_shares']}, "
+                    f"status={row['status']}, gates_failed={row['gates_failed']}"
+                )
+        finally:
+            conn.close()
+
+
+class TestStalePositionForceExit:
+    """Verify stale position force-exit after N consecutive gate failures."""
+
+    @patch("notifications._send_message", return_value=True)
+    @patch("notifications.send_regime_alert", return_value=True)
+    def test_stale_position_triggers_exit(self, mock_regime_alert, mock_send, tmp_path):
+        """After 5 consecutive gate failures while holding, force exit."""
+        db_path, db_factory = _make_test_db(tmp_path)
+
+        # Pre-populate 5 consecutive gate-fail decisions while holding
+        conn_setup = sqlite3.connect(str(db_path))
+        conn_setup.row_factory = sqlite3.Row
+        for i in range(5):
+            conn_setup.execute(
+                "INSERT INTO decisions (date, timestamp, gates_passed, current_shares, symbol, "
+                "regime, order_action, order_shares, order_value, status) "
+                "VALUES (?, ?, 0, 67, 'TQQQ', 'BULL', 'HOLD', 0, 0, 'COMPLETE')",
+                [f"2026-03-{10+i:02d}", f"2026-03-{10+i:02d}T15:50:00"],
+            )
+        conn_setup.commit()
+        conn_setup.close()
+
+        positions_with_tqqq = [
+            {"symbol": "TQQQ", "qty": 67, "market_value": 3100.0,
+             "avg_entry_price": 47.64, "current_price": 46.27,
+             "unrealized_pl": -91.0, "unrealized_plpc": -0.029},
+        ]
+
+        sell_order = {
+            "order_id": "test-stale-exit-123",
+            "status": "filled",
+            "symbol": "TQQQ",
+            "qty": 67,
+            "side": "sell",
+            "filled_avg_price": 46.27,
+            "filled_qty": 67,
+        }
+
+        with patch("db.models.get_connection", side_effect=db_factory), \
+             patch("alpaca_client.get_account", return_value=MOCK_ACCOUNT), \
+             patch("alpaca_client.get_positions", return_value=positions_with_tqqq), \
+             patch("alpaca_client.get_calendar", return_value=MOCK_CALENDAR), \
+             patch("alpaca_client.get_snapshot", return_value=MOCK_SNAPSHOT), \
+             patch("alpaca_client.submit_market_order", return_value=sell_order) as mock_order, \
+             patch("db.cache.get_bars_with_cache", return_value=BARS), \
+             patch("uw_client.get_combined_flow", return_value=MOCK_FLOW), \
+             patch("uw_client.get_tqqq_flow", return_value=MOCK_FLOW):
+
+            import job
+            job.cmd_run(halfday_check=False)
+
+        conn = _read_db(db_path)
+        try:
+            row = conn.execute(
+                "SELECT * FROM decisions WHERE symbol='TQQQ' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            assert row is not None
+            # After 5 consecutive gate failures, the system should have forced an exit
+            assert row["order_action"] in ("EXIT", "SELL"), (
+                f"Expected EXIT/SELL after stale position, got {row['order_action']}"
+            )
+            assert row["status"] == "EXECUTED", (
+                f"Stale position exit should execute, got status={row['status']}"
+            )
+        finally:
+            conn.close()

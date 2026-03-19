@@ -377,7 +377,8 @@ def run_sqqq_gate_checklist(data: dict) -> tuple[bool, list[str]]:
         failed.append("data_quality")
 
     # Gate S8: Mutual exclusivity — no TQQQ position
-    if data.get("has_tqqq_position", False):
+    # Exception: if TQQQ was just exited this cycle for rotation
+    if data.get("has_tqqq_position", False) and not data.get("tqqq_just_exited", False):
         failed.append("mutual_exclusivity")
 
     # Gate S9: Not in RISK_OFF or BREAKDOWN regime
