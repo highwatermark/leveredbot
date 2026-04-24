@@ -329,28 +329,45 @@ def calculate_target_shares(data: dict) -> dict:
 
 def run_sqqq_gate_checklist(data: dict) -> tuple[bool, list[str]]:
     """
-    Run the 9-gate SQQQ entry checklist. ALL gates must pass for SQQQ entry.
+    Run the SQQQ entry checklist. Two paths can pass:
+      Path 1 (k-NN): k-NN predicts SHORT with sufficient confidence
+      Path 2 (trend override): QQQ >3% below SMA-50 with ROC-20 < -2%
+
+    Common gates (S3-S9) must always pass.
 
     Args:
         data: Dict with knn_direction, knn_confidence, vol_regime, allocated_capital,
               is_execution_window, day_trades_remaining, trading_days_fetched,
-              has_tqqq_position, regime
+              has_tqqq_position, regime, pct_above_sma50, roc_slow
 
     Returns:
         (all_passed: bool, list_of_failed_gate_names: list[str])
     """
     failed = []
 
-    # Gate S1: k-NN must predict SHORT
+    # Signal gates: k-NN path OR trend override path
     knn_dir = data.get("knn_direction", "FLAT")
-    if knn_dir != "SHORT":
-        failed.append("knn_not_short")
-
-    # Gate S2: k-NN confidence above SQQQ threshold
     knn_conf = data.get("knn_confidence", 0.5)
-    min_conf = LEVERAGE_CONFIG.get("sqqq_min_knn_confidence", 0.60)
-    if knn_conf < min_conf:
-        failed.append("knn_confidence")
+    min_conf = LEVERAGE_CONFIG.get("sqqq_min_knn_confidence", 0.55)
+
+    knn_path = (knn_dir == "SHORT" and knn_conf >= min_conf)
+
+    # Trend override: QQQ deeply below SMA-50 with negative momentum
+    trend_override = False
+    if LEVERAGE_CONFIG.get("sqqq_trend_override", False):
+        pct_above_sma50 = data.get("pct_above_sma50", 0)
+        roc_slow = data.get("roc_slow", 0)
+        sma50_thresh = LEVERAGE_CONFIG.get("sqqq_trend_sma50_threshold", -0.03)
+        roc_thresh = LEVERAGE_CONFIG.get("sqqq_trend_roc_threshold", -0.02)
+        trend_override = (pct_above_sma50 < sma50_thresh and roc_slow < roc_thresh)
+
+    if not knn_path and not trend_override:
+        if knn_dir != "SHORT":
+            failed.append("knn_not_short")
+        if knn_conf < min_conf:
+            failed.append("knn_confidence")
+        if LEVERAGE_CONFIG.get("sqqq_trend_override", False) and not trend_override:
+            failed.append("trend_override")
 
     # Gate S3: Volatility not EXTREME
     vol_regime = data.get("vol_regime", "NORMAL")
@@ -405,6 +422,7 @@ def calculate_sqqq_target_shares(data: dict) -> dict:
     Returns:
         Same dict shape as calculate_target_shares() + "symbol": "SQQQ"
     """
+    knn_dir = data.get("knn_direction", "FLAT")
     knn_conf = data.get("knn_confidence", 0.5)
     vol_regime = data.get("vol_regime", "NORMAL")
     allocated = data.get("allocated_capital", 0)
@@ -412,17 +430,27 @@ def calculate_sqqq_target_shares(data: dict) -> dict:
     current_shares = data.get("current_shares", 0)
 
     max_pct = LEVERAGE_CONFIG.get("sqqq_max_position_pct", 0.40)
-    min_conf = LEVERAGE_CONFIG.get("sqqq_min_knn_confidence", 0.60)
+    min_conf = LEVERAGE_CONFIG.get("sqqq_min_knn_confidence", 0.55)
     limiting_factors = []
 
-    # Step 1: Confidence-driven sizing
-    # Linear: min_conf → 50% of max_pct, 0.80+ → 100% of max_pct
-    if knn_conf >= 0.80:
-        target_pct = max_pct
-    elif knn_conf >= min_conf:
-        scale = (knn_conf - min_conf) / (0.80 - min_conf)
-        target_pct = max_pct * (0.5 + 0.5 * scale)
-        limiting_factors.append(f"knn_conf={knn_conf:.2f}")
+    # Step 1: Determine sizing path
+    # Path A: k-NN SHORT with sufficient confidence → confidence-driven sizing
+    # Path B: Trend override (no k-NN SHORT) → conservative fixed sizing
+    knn_path = (knn_dir == "SHORT" and knn_conf >= min_conf)
+
+    if knn_path:
+        # Confidence-driven: min_conf → 50% of max, 0.80+ → 100% of max
+        if knn_conf >= 0.80:
+            target_pct = max_pct
+        else:
+            scale = (knn_conf - min_conf) / (0.80 - min_conf)
+            target_pct = max_pct * (0.5 + 0.5 * scale)
+            limiting_factors.append(f"knn_conf={knn_conf:.2f}")
+    elif LEVERAGE_CONFIG.get("sqqq_trend_override", False):
+        # Trend override: conservative fraction of max allocation
+        trend_frac = LEVERAGE_CONFIG.get("sqqq_trend_position_pct", 0.30)
+        target_pct = max_pct * trend_frac
+        limiting_factors.append("trend_override")
     else:
         target_pct = 0.0
         limiting_factors.append(f"knn_conf_too_low={knn_conf:.2f}")

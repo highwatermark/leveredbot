@@ -48,13 +48,13 @@ class TestSqqqGateChecklist:
         assert "knn_not_short" in failed
 
     def test_gate_s2_knn_confidence_too_low(self):
-        data = self._make_gate_data(knn_confidence=0.55)
+        data = self._make_gate_data(knn_confidence=0.50)
         passed, failed = run_sqqq_gate_checklist(data)
         assert "knn_confidence" in failed
 
     def test_gate_s2_knn_confidence_at_threshold(self):
-        """Exactly at threshold should pass."""
-        data = self._make_gate_data(knn_confidence=0.60)
+        """Exactly at threshold (0.55) should pass."""
+        data = self._make_gate_data(knn_confidence=0.55)
         passed, failed = run_sqqq_gate_checklist(data)
         assert "knn_confidence" not in failed
 
@@ -119,6 +119,7 @@ class TestSqqqGateChecklist:
 class TestCalculateSqqqTargetShares:
     def _make_sizing_data(self, **overrides):
         data = {
+            "knn_direction": "SHORT",
             "knn_confidence": 0.70,
             "vol_regime": "NORMAL",
             "allocated_capital": 30000,
@@ -129,8 +130,8 @@ class TestCalculateSqqqTargetShares:
         return data
 
     def test_sizing_at_min_confidence(self):
-        """At 0.60 confidence → 50% of max (40%) = 20% allocation."""
-        data = self._make_sizing_data(knn_confidence=0.60)
+        """At 0.55 confidence → 50% of max (40%) = 20% allocation."""
+        data = self._make_sizing_data(knn_confidence=0.55)
         result = calculate_sqqq_target_shares(data)
         # 0.40 * 0.50 = 0.20 → 30000 * 0.20 = 6000 / 12.50 = 480 shares
         assert result["target_shares"] == 480
@@ -138,8 +139,8 @@ class TestCalculateSqqqTargetShares:
         assert result["action"] == "BUY"
 
     def test_sizing_at_mid_confidence(self):
-        """At 0.70 confidence → 75% of max (40%) = 30% allocation."""
-        data = self._make_sizing_data(knn_confidence=0.70)
+        """At 0.675 confidence → 75% of max (40%) = 30% allocation."""
+        data = self._make_sizing_data(knn_confidence=0.675)
         result = calculate_sqqq_target_shares(data)
         # 0.40 * (0.5 + 0.5 * 0.5) = 0.40 * 0.75 = 0.30 → 30000 * 0.30 = 9000 / 12.50 = 720
         assert result["target_shares"] == 720
@@ -151,11 +152,20 @@ class TestCalculateSqqqTargetShares:
         # 0.40 → 30000 * 0.40 = 12000 / 12.50 = 960
         assert result["target_shares"] == 960
 
-    def test_sizing_below_threshold(self):
-        """Below min confidence → 0 shares."""
-        data = self._make_sizing_data(knn_confidence=0.50)
+    def test_sizing_below_threshold_no_trend(self):
+        """Below min confidence with no trend override → 0 shares."""
+        with patch.dict("config.LEVERAGE_CONFIG", {"sqqq_trend_override": False}, clear=False):
+            data = self._make_sizing_data(knn_direction="FLAT", knn_confidence=0.50)
+            result = calculate_sqqq_target_shares(data)
+            assert result["target_shares"] == 0
+
+    def test_sizing_trend_override(self):
+        """Non-SHORT k-NN with trend override → conservative sizing."""
+        data = self._make_sizing_data(knn_direction="LONG", knn_confidence=0.60)
         result = calculate_sqqq_target_shares(data)
-        assert result["target_shares"] == 0
+        # trend_override: 0.40 * 0.30 = 0.12 → 30000 * 0.12 = 3600 / 12.50 = 288
+        assert result["target_shares"] == 288
+        assert "trend_override" in str(result["limiting_factors"])
 
     def test_vol_high_adjustment(self):
         """HIGH vol halves the allocation."""
@@ -172,15 +182,16 @@ class TestCalculateSqqqTargetShares:
         assert result["target_shares"] == 0
 
     def test_exit_action_when_holding(self):
-        """When confidence drops and holding shares → EXIT."""
-        data = self._make_sizing_data(knn_confidence=0.50, current_shares=500)
-        result = calculate_sqqq_target_shares(data)
-        assert result["target_shares"] == 0
-        assert result["action"] == "EXIT"
+        """When k-NN not SHORT and holding shares with no trend override → EXIT."""
+        with patch.dict("config.LEVERAGE_CONFIG", {"sqqq_trend_override": False}, clear=False):
+            data = self._make_sizing_data(knn_direction="FLAT", knn_confidence=0.50, current_shares=500)
+            result = calculate_sqqq_target_shares(data)
+            assert result["target_shares"] == 0
+            assert result["action"] == "EXIT"
 
     def test_hold_when_delta_below_min_trade(self):
         """Small delta → HOLD."""
-        data = self._make_sizing_data(knn_confidence=0.70, current_shares=719)
+        data = self._make_sizing_data(knn_confidence=0.675, current_shares=719)
         result = calculate_sqqq_target_shares(data)
         # Target is 720, current is 719, delta = 1 * 12.50 = $12.50 < $100
         assert result["action"] == "HOLD"
@@ -195,12 +206,71 @@ class TestCalculateSqqqTargetShares:
         with patch.dict("config.LEVERAGE_CONFIG", {
             "sqqq_max_position_pct": 0.50,
             "sqqq_min_knn_confidence": 0.55,
+            "sqqq_trend_override": False,
             "min_trade_value": 100,
         }):
             data = self._make_sizing_data(knn_confidence=0.55)
             result = calculate_sqqq_target_shares(data)
             # 0.50 * 0.50 = 0.25 → 30000 * 0.25 = 7500 / 12.50 = 600
             assert result["target_shares"] == 600
+
+
+class TestSqqqTrendOverrideGate:
+    """Test that trend override allows SQQQ entry without k-NN SHORT."""
+
+    def _make_gate_data(self, **overrides):
+        data = {
+            "knn_direction": "LONG",
+            "knn_confidence": 0.60,
+            "vol_regime": "NORMAL",
+            "allocated_capital": 30000,
+            "is_execution_window": True,
+            "day_trades_remaining": 5,
+            "trading_days_fetched": 278,
+            "has_tqqq_position": False,
+            "regime": "BULL",
+            "pct_above_sma50": -0.05,
+            "roc_slow": -0.03,
+        }
+        data.update(overrides)
+        return data
+
+    def test_trend_override_passes_without_knn_short(self):
+        """QQQ deeply below SMA-50 with negative momentum → pass via trend override."""
+        data = self._make_gate_data()
+        passed, failed = run_sqqq_gate_checklist(data)
+        assert passed is True
+        assert "knn_not_short" not in failed
+
+    def test_trend_override_fails_when_not_bearish_enough(self):
+        """QQQ only slightly below SMA-50 → no trend override, fails on k-NN."""
+        data = self._make_gate_data(pct_above_sma50=-0.01, roc_slow=-0.03)
+        passed, failed = run_sqqq_gate_checklist(data)
+        assert passed is False
+        assert "knn_not_short" in failed
+
+    def test_trend_override_fails_when_momentum_not_negative(self):
+        """QQQ below SMA-50 but momentum positive → no trend override."""
+        data = self._make_gate_data(pct_above_sma50=-0.05, roc_slow=0.01)
+        passed, failed = run_sqqq_gate_checklist(data)
+        assert passed is False
+
+    def test_trend_override_disabled(self):
+        """When sqqq_trend_override is False, must rely on k-NN."""
+        with patch.dict("config.LEVERAGE_CONFIG", {"sqqq_trend_override": False}, clear=False):
+            data = self._make_gate_data()
+            passed, failed = run_sqqq_gate_checklist(data)
+            assert passed is False
+            assert "knn_not_short" in failed
+
+    def test_knn_short_still_works(self):
+        """k-NN SHORT path still works even with trend override enabled."""
+        data = self._make_gate_data(
+            knn_direction="SHORT", knn_confidence=0.65,
+            pct_above_sma50=0.02, roc_slow=0.01,  # no trend signal
+        )
+        passed, failed = run_sqqq_gate_checklist(data)
+        assert passed is True
 
 
 class TestSqqqGateRotationBypass:

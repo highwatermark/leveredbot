@@ -118,7 +118,11 @@ LEVERAGE_CONFIG = {
 
     # SQQQ (inverse) trading
     "use_sqqq_trading": True,             # Enable SQQQ entries on k-NN SHORT signals
-    "sqqq_min_knn_confidence": 0.60,      # Minimum k-NN confidence for SQQQ entry
+    "sqqq_min_knn_confidence": 0.55,      # Minimum k-NN confidence for SQQQ entry
+    "sqqq_trend_override": True,          # Allow SQQQ entry on bearish trend without k-NN SHORT
+    "sqqq_trend_sma50_threshold": -0.03,  # QQQ must be >3% below SMA-50 for trend override
+    "sqqq_trend_roc_threshold": -0.02,    # ROC-20 must be < -2% for trend override
+    "sqqq_trend_position_pct": 0.30,      # Fraction of sqqq_max_position_pct for trend entries
     "sqqq_max_position_pct": 0.40,        # Max 40% of allocated capital in SQQQ
 
     # Stale position protection

@@ -429,12 +429,16 @@ def _build_sqqq_gate_data(signals: "StrategySignals", is_half_day: bool = False,
         "has_tqqq_position": signals.has_tqqq_position,
         "regime": signals.effective_regime,
         "tqqq_just_exited": tqqq_just_exited,
+        # Trend override fields
+        "pct_above_sma50": signals.pct_above_sma50,
+        "roc_slow": signals.momentum.get("roc_slow", 0),
     }
 
 
 def _build_sqqq_sizing_data(signals: "StrategySignals") -> dict:
     """Build the SQQQ sizing calculation input dict from computed signals."""
     return {
+        "knn_direction": signals.knn_direction,
         "knn_confidence": signals.knn_confidence,
         "vol_regime": signals.vol_regime,
         "allocated_capital": signals.allocated_capital,
