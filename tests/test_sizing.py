@@ -191,8 +191,18 @@ class TestGateChecklist:
 class TestCalculateTargetShares:
     @pytest.fixture(autouse=True)
     def _legacy_path(self):
-        """Sizing tests target the legacy (non-sleeve) math; sleeve engine has its own tests."""
-        with patch.dict("config.LEVERAGE_CONFIG", {"use_rule_sleeves": False}, clear=False):
+        """Sizing tests target the legacy (non-sleeve) math; sleeve engine has its own tests.
+        Regime targets pinned to the values these expectations were written against."""
+        with patch.dict(
+            "config.LEVERAGE_CONFIG",
+            {
+                "use_rule_sleeves": False,
+                "max_position_pct": 0.20,
+                "bull_position_pct": 0.15,
+                "cautious_position_pct": 0.08,
+            },
+            clear=False,
+        ):
             yield
 
     def test_strong_bull_full_allocation(self):

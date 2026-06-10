@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-06-10 (2) — Sizing raised to 3x tier after decade stress-test
+
+Replayed the new system through 2018 Q4, COVID 2020, the 2022 bear, and the
+full 2017–2026 decade at four sizing tiers. The deployed (1x) sizing maxed out
+at 17% deployment — too conservative to compound. Chosen tier: **3x**
+(sleeves ×3, regime caps 0.60 STRONG_BULL / 0.45 BULL). Decade replay at this
+tier: ~17% CAGR, worst-ever drawdown −16.8%, +17% through the 2022 bear
+(regime authority keeps the system in cash below SMA-250).
+
+- `max_position_pct` 0.20 → 0.60, `bull_position_pct` 0.15 → 0.45
+- Bull sleeves ×3: trend_core 0.36, breakout 0.15, pullback 0.12,
+  mean_reversion 0.12
+- `max_portfolio_pct` stays 0.30 on the shared account
+- New `docs/PROFILE_2K_DEDICATED.md`: profile for a dedicated $2k account
+  (`max_portfolio_pct: 1.0`)
+- Legacy sizing tests pin the old regime targets they assert against
+
 ## 2026-06-10 — Bench SQQQ, regime authority, sleeve engine (live-validation release)
 
 Root-cause review of live trading (Feb 9 – Jun 10) found the deployed system

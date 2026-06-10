@@ -37,10 +37,13 @@ LEVERAGE_CONFIG = {
     "underlying": "QQQ",
 
     # Capital Allocation
-    "max_portfolio_pct": 0.30,      # Max 30% of total account equity
-    "max_position_pct": 0.20,       # Strong-bull target as % of allocated capital
-    "bull_position_pct": 0.15,      # Bull target as % of allocated capital
-    "cautious_position_pct": 0.08,  # Partial-risk target when trend is mixed
+    "max_portfolio_pct": 0.30,      # Max 30% of total account equity (shared with momentum-agent)
+    # 2026-06-10: sizing raised to the "3x tier" after decade stress-test
+    # (2018/2020/2022 replays: worst-ever DD -16.8%, +17% through the 2022 bear).
+    # See docs/PROFILE_2K_DEDICATED.md for the dedicated-account profile.
+    "max_position_pct": 0.60,       # Strong-bull target as % of allocated capital
+    "bull_position_pct": 0.45,      # Bull target as % of allocated capital
+    "cautious_position_pct": 0.24,  # Partial-risk target when trend is mixed
     "min_position_pct": 0.10,       # Minimum position if Risk-On
 
     # Regime Detection (on QQQ)
@@ -140,11 +143,12 @@ LEVERAGE_CONFIG = {
     "sleeve_model_disagreement_mult": 0.90,
     "sleeve_cash_buffer_pct": 0.0025,
     # Bull sleeves (target pct of allocated capital; capped by regime target)
-    "sleeve_trend_core_pct": 0.12,
-    "sleeve_breakout_pct": 0.05,
-    "sleeve_pullback_pct": 0.04,
-    "sleeve_mean_reversion_pct": 0.04,
-    "sleeve_cautious_bull_pct": 0.03,
+    # 3x tier sizing (2026-06-10)
+    "sleeve_trend_core_pct": 0.36,
+    "sleeve_breakout_pct": 0.15,
+    "sleeve_pullback_pct": 0.12,
+    "sleeve_mean_reversion_pct": 0.12,
+    "sleeve_cautious_bull_pct": 0.09,
     # Bear sleeves (target pct of allocated capital; capped by sqqq_max_position_pct)
     "sleeve_breakdown_short_pct": 0.12,
     "sleeve_bear_rally_pct": 0.05,
