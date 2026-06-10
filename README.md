@@ -56,7 +56,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 
-# Configure environment
+# Configure environment in this repo
 cp .env.example .env
 # Edit .env with your API keys (Alpaca, Telegram, Unusual Whales)
 ```

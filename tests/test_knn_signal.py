@@ -95,25 +95,25 @@ def _make_microstructure_data(bars):
 class TestFeatureCalculator:
     """Test feature vector computation."""
 
-    def test_compute_features_returns_16_elements(self):
+    def test_compute_features_returns_feature_count(self):
         bars = _make_bars(300)
         features = FeatureCalculator.compute_features(bars, 250)
         assert features is not None
-        assert len(features) == 20
+        assert len(features) == FeatureCalculator.FEATURE_COUNT
 
     def test_compute_features_with_vix(self):
         bars = _make_bars(300)
         vix = _make_vix_data(bars)
         features = FeatureCalculator.compute_features(bars, 250, vix_by_date=vix)
         assert features is not None
-        assert len(features) == 20
+        assert len(features) == FeatureCalculator.FEATURE_COUNT
 
     def test_compute_features_with_cross_asset(self):
         bars = _make_bars(300)
         cross = _make_cross_asset_bars(bars)
         features = FeatureCalculator.compute_features(bars, 250, cross_asset_bars=cross)
         assert features is not None
-        assert len(features) == 20
+        assert len(features) == FeatureCalculator.FEATURE_COUNT
         # Cross-asset features should be non-zero with aligned data
         tlt_ret = features[12]
         gld_ret = features[13]
@@ -147,7 +147,7 @@ class TestFeatureCalculator:
         micro = _make_microstructure_data(bars)
         features = FeatureCalculator.compute_features(bars, 250, microstructure_by_date=micro)
         assert features is not None
-        assert len(features) == 20
+        assert len(features) == FeatureCalculator.FEATURE_COUNT
         # Microstructure features should be non-zero with data
         assert features[16] != 0.0 or features[17] != 0.0  # at least one non-zero
 
@@ -168,7 +168,7 @@ class TestFeatureCalculator:
 
     def test_feature_names_match_count(self):
         names = FeatureCalculator.feature_names()
-        assert len(names) == 20
+        assert len(names) == FeatureCalculator.FEATURE_COUNT
         assert len(names) == FeatureCalculator.FEATURE_COUNT
 
     def test_feature_names_content(self):
@@ -184,6 +184,10 @@ class TestFeatureCalculator:
         assert "vwap_deviation" in names
         assert "closing_momentum" in names
         assert "volume_acceleration" in names
+        assert "overnight_gap" in names
+        assert "close_location_value" in names
+        assert "downside_vol_5d" in names
+        assert "ma50_slope_10d" in names
         # Removed features should NOT be present
         assert "prior_day_return" not in names
         assert "two_day_return" not in names
@@ -244,6 +248,15 @@ class TestFeatureCalculator:
         assert features is not None
         vix_change = features[11]
         assert vix_change > 0.5  # (30 - 15) / 15 = 1.0
+
+    def test_new_execution_path_features_are_finite(self):
+        bars = _make_bars(300)
+        features = FeatureCalculator.compute_features(bars, 250)
+        assert features is not None
+        assert np.isfinite(features[20])
+        assert -1.0 <= features[21] <= 1.0
+        assert features[22] >= 0.0
+        assert np.isfinite(features[23])
 
     def test_distance_from_7ma(self):
         """In an uptrend, close should be above 7-MA."""
@@ -318,7 +331,7 @@ class TestKNNSignal:
         assert knn.fit_from_bars(bars) is True
         assert knn.is_fitted
         assert knn.training_samples > 200
-        assert knn.feature_count == 20
+        assert knn.feature_count == FeatureCalculator.FEATURE_COUNT
 
     def test_fit_with_vix_data(self):
         bars = _make_bars(500)
@@ -341,7 +354,7 @@ class TestKNNSignal:
         knn = KNNSignal(n_neighbors=5)
         assert knn.fit_from_bars(bars, microstructure_by_date=micro) is True
         assert knn.is_fitted
-        assert knn.feature_count == 20
+        assert knn.feature_count == FeatureCalculator.FEATURE_COUNT
 
     def test_fit_returns_false_with_insufficient_data(self):
         bars = _make_bars(100)
@@ -418,7 +431,7 @@ class TestKNNSignal:
         knn2 = KNNSignal()
         assert knn2.load(model_path) is True
         assert knn2.is_fitted
-        assert knn2.feature_count == 20
+        assert knn2.feature_count == FeatureCalculator.FEATURE_COUNT
         assert knn2.feature_version == FEATURE_VERSION
         loaded_pred = knn2.predict(bars)
 

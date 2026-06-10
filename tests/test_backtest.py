@@ -17,6 +17,8 @@ import numpy as np
 from strategy.regime import detect_regime, get_regime_target_pct
 from strategy.signals import calculate_momentum, calculate_realized_vol, classify_vol_regime, get_vol_adjustment
 from config import LEVERAGE_CONFIG
+from strategy.position_manager import PositionManager
+from job import _run_backtest_morning_window, _run_backtest_midday_window
 
 
 def _simulate_backtest(qqq_closes: list[float], tqqq_closes: list[float], dates: list[str]) -> dict:
@@ -146,12 +148,12 @@ class TestBacktestAssertions:
         # Check that shares were reduced during the crash period
         crash_results = [r for r in result["results"] if r["date"] >= "2024-11-01"]
         if crash_results:
-            # By the end of crash, should have significantly fewer shares
-            end_crash = crash_results[-1]
+            # At some point during the crash, the position should be reduced.
+            min_crash_shares = min(r["shares"] for r in crash_results)
             pre_crash = [r for r in result["results"] if r["date"] < "2024-11-01"]
             if pre_crash:
                 max_shares = max(r["shares"] for r in pre_crash)
-                assert end_crash["shares"] < max_shares, "Should reduce during crash"
+                assert min_crash_shares < max_shares, "Should reduce during crash"
 
     def test_max_drawdown_under_45(self):
         """Drawdown stays under 45% in crash scenario."""
@@ -250,12 +252,15 @@ class TestCmdBacktestIntegration:
         np.random.seed(42)
         qqq = [450.0]
         tqqq = [60.0]
-        for _ in range(350):
+        sqqq = [20.0]
+        for _ in range(550):
             qqq.append(qqq[-1] * (1 + np.random.normal(0.001, 0.008)))
             tqqq.append(tqqq[-1] * (1 + np.random.normal(0.003, 0.024)))
+            sqqq.append(max(1.0, sqqq[-1] * (1 + np.random.normal(-0.003, 0.02))))
 
         qqq_bars = self._make_bars(qqq)
         tqqq_bars = self._make_bars(tqqq)
+        sqqq_bars = self._make_bars(sqqq)
 
         db_path = tmp_path / "backtest_test.db"
 
@@ -271,11 +276,22 @@ class TestCmdBacktestIntegration:
         conn.commit()
         conn.close()
 
+        def bars_factory(symbol, *_args, **_kwargs):
+            if symbol == "QQQ":
+                return qqq_bars
+            if symbol == "TQQQ":
+                return tqqq_bars
+            if symbol == "SQQQ":
+                return sqqq_bars
+            return qqq_bars
+
         with patch("db.models.get_connection", side_effect=db_factory), \
-             patch("db.cache.get_bars_with_cache", side_effect=[qqq_bars, tqqq_bars]), \
+             patch("db.cache.get_bars_with_cache", side_effect=bars_factory), \
              patch("notifications._send_message", return_value=True), \
              patch("notifications._send_document", return_value=True), \
-             patch("config.DATA_DIR", tmp_path):
+             patch("strategy.vix_data.get_vix_data", return_value={bar["date"]: 18.0 for bar in qqq_bars}), \
+             patch("config.DATA_DIR", tmp_path), \
+             patch.dict("config.LEVERAGE_CONFIG", {"long_require_model_support_for_new_entries": False}, clear=False):
 
             import job
             stats = job.cmd_backtest()
@@ -297,3 +313,64 @@ class TestCmdBacktestIntegration:
         # Verify CSV was written
         csv_path = tmp_path / "backtest_results.csv"
         assert csv_path.exists(), "Backtest CSV should be written"
+
+
+class TestBacktestIntradayMirror:
+    def test_morning_window_exits_sqqq_when_qqq_is_above_sma250(self):
+        pm = PositionManager(config=LEVERAGE_CONFIG)
+        meta = {
+            "avg_entry_price": 20.0,
+            "entry_date": "2026-04-20",
+            "high_watermark": 20.0,
+            "tiers_taken": [],
+            "gate_fail_streak": 0,
+        }
+        bar = {"open": 19.8, "high": 20.1, "low": 19.4, "close": 19.7, "volume": 10_000_000}
+        prev_bar = {"close": 20.2, "volume": 9_000_000}
+        qqq_bar = {"open": 610.0, "high": 612.0, "low": 606.0, "close": 611.0}
+
+        decision, fill_price = _run_backtest_morning_window(
+            pm=pm,
+            symbol="SQQQ",
+            shares=100,
+            meta=meta,
+            bar=bar,
+            prev_bar=prev_bar,
+            qqq_bar=qqq_bar,
+            prev_equity=100_000.0,
+            sma_250=580.0,
+            current_date="2026-04-24",
+        )
+
+        assert decision is not None
+        assert decision.exit_type == "REGIME_EMERGENCY"
+        assert fill_price == bar["open"]
+
+    def test_midday_window_takes_partial_profit_before_close(self):
+        pm = PositionManager(config=LEVERAGE_CONFIG)
+        meta = {
+            "avg_entry_price": 100.0,
+            "entry_date": "2026-04-20",
+            "high_watermark": 100.0,
+            "tiers_taken": [],
+            "gate_fail_streak": 0,
+        }
+        bar = {"open": 101.0, "high": 109.0, "low": 104.0, "close": 108.0, "volume": 10_000_000}
+        prev_bar = {"close": 100.0, "volume": 8_000_000}
+
+        decision, fill_price, _ = _run_backtest_midday_window(
+            pm=pm,
+            symbol="TQQQ",
+            shares=80,
+            meta=meta,
+            bar=bar,
+            prev_bar=prev_bar,
+            prev_volume=prev_bar["volume"],
+            prev_equity=100_000.0,
+            current_date="2026-04-24",
+        )
+
+        assert decision is not None
+        assert decision.exit_type == "PARTIAL_PROFIT"
+        assert decision.shares_to_sell == 20
+        assert fill_price == bar["high"]

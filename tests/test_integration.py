@@ -173,6 +173,10 @@ class TestCmdRunIntegration:
             perf = conn.execute("SELECT * FROM performance ORDER BY id DESC LIMIT 1").fetchone()
             assert perf is not None, "Expected a performance record to be logged"
             assert perf["regime"] is not None
+            assert perf["strategy_equity"] > 0
+            assert perf["account_equity"] == MOCK_ACCOUNT["equity"]
+            assert perf["other_positions_value"] == 0
+            assert perf["strategy_total_return_pct"] == 0
         finally:
             conn.close()
 

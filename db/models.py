@@ -136,6 +136,10 @@ def init_tables(conn: sqlite3.Connection | None = None) -> None:
         CREATE TABLE IF NOT EXISTS performance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT NOT NULL,
+            account_equity REAL DEFAULT 0,
+            other_positions_value REAL DEFAULT 0,
+            strategy_equity REAL DEFAULT 0,
+            strategy_pnl_day REAL DEFAULT 0,
             tqqq_shares INTEGER,
             tqqq_avg_cost REAL,
             tqqq_current_price REAL,
@@ -225,9 +229,13 @@ def init_tables(conn: sqlite3.Connection | None = None) -> None:
             date TEXT NOT NULL,
             qqq_close REAL,
             tqqq_close REAL,
+            sqqq_close REAL DEFAULT 0,
             regime TEXT,
             target_shares INTEGER,
             held_shares INTEGER,
+            sqqq_shares INTEGER DEFAULT 0,
+            effective_model_direction TEXT DEFAULT 'FLAT',
+            model_source TEXT DEFAULT 'neutral',
             portfolio_value REAL,
             cash REAL,
             pnl_day REAL,
@@ -264,9 +272,19 @@ def init_tables(conn: sqlite3.Connection | None = None) -> None:
                 ("sqqq_pnl_pct", "REAL", "0"),
             ]),
             ("performance", [
+                ("account_equity", "REAL", "0"),
+                ("other_positions_value", "REAL", "0"),
+                ("strategy_equity", "REAL", "0"),
+                ("strategy_pnl_day", "REAL", "0"),
                 ("sqqq_shares", "INTEGER", "0"),
                 ("sqqq_position_value", "REAL", "0"),
                 ("sqqq_pnl_pct", "REAL", "0"),
+            ]),
+            ("backtest_results", [
+                ("sqqq_close", "REAL", "0"),
+                ("sqqq_shares", "INTEGER", "0"),
+                ("effective_model_direction", "TEXT", "'FLAT'"),
+                ("model_source", "TEXT", "'neutral'"),
             ]),
         ]:
             for col, col_type, default in cols:
@@ -349,6 +367,20 @@ def log_daily_performance(data: dict, conn: sqlite3.Connection | None = None) ->
         )
 
 
+def get_latest_performance(conn: sqlite3.Connection | None = None) -> dict | None:
+    """Return the most recent performance row."""
+    with get_db(conn) as c:
+        row = c.execute("SELECT * FROM performance ORDER BY id DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+
+
+def get_first_performance(conn: sqlite3.Connection | None = None) -> dict | None:
+    """Return the first performance row for total-return anchoring."""
+    with get_db(conn) as c:
+        row = c.execute("SELECT * FROM performance ORDER BY id ASC LIMIT 1").fetchone()
+        return dict(row) if row else None
+
+
 def get_last_regime(conn: sqlite3.Connection | None = None) -> str | None:
     """Get the most recent regime from the decisions table."""
     with get_db(conn) as c:
@@ -373,15 +405,15 @@ def get_regime_duration_days(conn: sqlite3.Connection | None = None) -> int:
 
 
 def get_consecutive_losing_days(conn: sqlite3.Connection | None = None) -> int:
-    """Count consecutive days where TQQQ position P&L was negative."""
+    """Count consecutive days where sleeve-level daily P&L was negative."""
     with get_db(conn) as c:
         rows = c.execute(
-            "SELECT tqqq_pnl_day FROM performance ORDER BY id DESC LIMIT 30"
+            "SELECT strategy_pnl_day FROM performance ORDER BY id DESC LIMIT 30"
         ).fetchall()
 
         count = 0
         for row in rows:
-            if row["tqqq_pnl_day"] is not None and row["tqqq_pnl_day"] < 0:
+            if row["strategy_pnl_day"] is not None and row["strategy_pnl_day"] < 0:
                 count += 1
             else:
                 break
@@ -436,11 +468,11 @@ def get_strategy_state(conn: sqlite3.Connection | None = None) -> dict:
 
         # Consecutive losing days from performance
         perf_rows = c.execute(
-            "SELECT tqqq_pnl_day FROM performance ORDER BY id DESC LIMIT 30"
+            "SELECT strategy_pnl_day FROM performance ORDER BY id DESC LIMIT 30"
         ).fetchall()
         losing_days = 0
         for row in perf_rows:
-            if row["tqqq_pnl_day"] is not None and row["tqqq_pnl_day"] < 0:
+            if row["strategy_pnl_day"] is not None and row["strategy_pnl_day"] < 0:
                 losing_days += 1
             else:
                 break
@@ -499,7 +531,7 @@ def get_performance_summary(
         if not rows:
             return {"days": 0, "total_pnl": 0, "avg_daily_pnl": 0, "best_day": 0, "worst_day": 0}
 
-        pnls = [r["tqqq_pnl_day"] or 0 for r in rows]
+        pnls = [r["strategy_pnl_day"] or 0 for r in rows]
         return {
             "days": len(rows),
             "total_pnl": sum(pnls),

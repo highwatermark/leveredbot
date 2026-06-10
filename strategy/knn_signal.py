@@ -2,9 +2,9 @@
 k-NN direction prediction as a signal overlay.
 
 Predicts next-day QQQ direction (LONG/SHORT/FLAT) using distance-weighted
-k-NN classification on a 20-feature vector computed from daily bar data.
+k-NN classification on a 24-feature vector computed from daily bar data.
 
-Features (20):
+Features (24):
   # Price-based
   1. intraday_return      - open->close return
   2. five_day_return      - 5-day cumulative return
@@ -34,6 +34,10 @@ Features (20):
   18. vwap_deviation          - (close - VWAP) / VWAP
   19. closing_momentum        - last_30min_return - day_return
   20. volume_acceleration     - volume(last 2h) / volume(first 2h)
+  21. overnight_gap           - (open - prev_close) / prev_close
+  22. close_location_value    - where close sits in the day's range (-1 to +1)
+  23. downside_vol_5d         - 5-day downside-volatility proxy
+  24. ma50_slope_10d          - 10-day slope of the 50-day moving average
 
 Usage:
     knn = KNNSignal()
@@ -59,13 +63,13 @@ logger = logging.getLogger(__name__)
 MIN_TRAINING_SAMPLES = 200
 
 # Feature version — bump when feature set changes to auto-reject old models
-FEATURE_VERSION = 3
+FEATURE_VERSION = 4
 
 
 class FeatureCalculator:
-    """Compute the 20-feature vector from daily bar data + VIX + cross-asset + microstructure."""
+    """Compute the 24-feature vector from daily bar data + VIX + cross-asset + microstructure."""
 
-    FEATURE_COUNT = 20
+    FEATURE_COUNT = 24
 
     # Default VIX values when data is unavailable (VIX ~20 is "normal")
     DEFAULT_VIX = 20.0
@@ -164,7 +168,7 @@ class FeatureCalculator:
         microstructure_by_date: dict[str, dict[str, float]] | None = None,
     ) -> np.ndarray | None:
         """
-        Compute 20-feature vector at a given bar index.
+        Compute 24-feature vector at a given bar index.
 
         Args:
             bars: List of bar dicts with keys: date, open, high, low, close, volume
@@ -174,7 +178,7 @@ class FeatureCalculator:
             microstructure_by_date: Optional mapping of date->microstructure features.
 
         Returns:
-            numpy array of 20 features, or None if insufficient data
+            numpy array of 24 features, or None if insufficient data
         """
         if index < 200:
             return None
@@ -328,6 +332,31 @@ class FeatureCalculator:
         # Feature 20: volume_acceleration
         volume_acceleration = micro.get("volume_acceleration", 0.0)
 
+        # ── Execution-path context ──
+
+        prev_close = prev["close"]
+        overnight_gap = (open_price - prev_close) / prev_close if prev_close > 0 else 0.0
+
+        day_range = high - low
+        close_location_value = (((close - low) / day_range) * 2 - 1) if day_range > 0 else 0.0
+
+        returns_5d = []
+        for offset in range(5):
+            if index - offset - 1 < 0:
+                break
+            curr = bars[index - offset]["close"]
+            past = bars[index - offset - 1]["close"]
+            if past > 0:
+                returns_5d.append((curr - past) / past)
+        negative_returns = [min(r, 0.0) for r in returns_5d]
+        downside_vol_5d = float(np.std(negative_returns)) if negative_returns else 0.0
+
+        if index >= 59:
+            ma50_10d_ago = float(np.mean([b["close"] for b in bars[index - 59:index - 9]]))
+            ma50_slope_10d = ((ma50 - ma50_10d_ago) / ma50_10d_ago) if ma50_10d_ago > 0 else 0.0
+        else:
+            ma50_slope_10d = 0.0
+
         return np.array([
             intraday_return,          # 0 - price
             five_day_return,          # 1 - price
@@ -349,6 +378,10 @@ class FeatureCalculator:
             vwap_deviation_feat,      # 17 - microstructure
             closing_momentum,         # 18 - microstructure
             volume_acceleration,      # 19 - microstructure
+            overnight_gap,            # 20 - gap / execution timing
+            close_location_value,     # 21 - intraday range structure
+            downside_vol_5d,          # 22 - downside asymmetry
+            ma50_slope_10d,           # 23 - trend persistence
         ])
 
     @staticmethod
@@ -374,6 +407,10 @@ class FeatureCalculator:
             "vwap_deviation",
             "closing_momentum",
             "volume_acceleration",
+            "overnight_gap",
+            "close_location_value",
+            "downside_vol_5d",
+            "ma50_slope_10d",
         ]
 
 

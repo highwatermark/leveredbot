@@ -14,19 +14,36 @@ from strategy.sizing import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _legacy_sqqq_path():
+    """These tests exercise the legacy (non-sleeve) SQQQ gate/sizing paths.
+    SQQQ is benched by default (use_sqqq_trading=False) but the machinery
+    stays tested so it can be re-enabled behind a validated short model."""
+    with patch.dict(
+        "config.LEVERAGE_CONFIG",
+        {"use_rule_sleeves": False, "use_sqqq_trading": True},
+        clear=False,
+    ):
+        yield
+
+
 class TestSqqqGateChecklist:
     def _make_gate_data(self, **overrides):
-        """Create default SQQQ gate data that passes all 9 gates."""
+        """Create default SQQQ gate data that passes the inverse-regime policy."""
         data = {
             "knn_direction": "SHORT",
             "knn_confidence": 0.70,
+            "raw_knn_direction": "SHORT",
+            "raw_knn_confidence": 0.70,
+            "raw_xgb_direction": "SHORT",
+            "raw_xgb_confidence": 0.70,
             "vol_regime": "NORMAL",
             "allocated_capital": 30000,
             "is_execution_window": True,
             "day_trades_remaining": 5,
             "trading_days_fetched": 278,
             "has_tqqq_position": False,
-            "regime": "BULL",
+            "regime": "RISK_OFF",
         }
         data.update(overrides)
         return data
@@ -95,25 +112,39 @@ class TestSqqqGateChecklist:
         passed, failed = run_sqqq_gate_checklist(data)
         assert "mutual_exclusivity" in failed
 
-    def test_gate_s9_regime_risk_off(self):
-        data = self._make_gate_data(regime="RISK_OFF")
+    def test_gate_s9_regime_bull_blocks_inverse(self):
+        data = self._make_gate_data(regime="BULL")
         passed, failed = run_sqqq_gate_checklist(data)
-        assert "regime_risk_off" in failed
+        assert "regime_not_inverse" in failed
 
-    def test_gate_s9_regime_breakdown(self):
+    def test_gate_s9_regime_breakdown_passes(self):
         data = self._make_gate_data(regime="BREAKDOWN")
         passed, failed = run_sqqq_gate_checklist(data)
-        assert "regime_risk_off" in failed
+        assert "regime_not_inverse" not in failed
+        assert passed is True
+
+    def test_gate_s9_strong_bull_can_opt_in(self):
+        with patch.dict("config.LEVERAGE_CONFIG", {"allow_inverse_in_strong_bull": True}, clear=False):
+            data = self._make_gate_data(regime="STRONG_BULL")
+            passed, failed = run_sqqq_gate_checklist(data)
+            assert "regime_not_inverse" not in failed
+            assert passed is True
 
     def test_multiple_gates_fail(self):
         data = self._make_gate_data(
             knn_direction="FLAT",
             knn_confidence=0.3,
             has_tqqq_position=True,
-            regime="RISK_OFF",
+            regime="BULL",
         )
         passed, failed = run_sqqq_gate_checklist(data)
         assert len(failed) >= 4
+
+    def test_single_bearish_model_vote_fails_agreement_gate(self):
+        data = self._make_gate_data(raw_xgb_direction="FLAT", raw_xgb_confidence=0.50)
+        passed, failed = run_sqqq_gate_checklist(data)
+        assert passed is False
+        assert "model_agreement" in failed
 
 
 class TestCalculateSqqqTargetShares:
@@ -121,10 +152,17 @@ class TestCalculateSqqqTargetShares:
         data = {
             "knn_direction": "SHORT",
             "knn_confidence": 0.70,
+            "raw_knn_direction": "SHORT",
+            "raw_knn_confidence": 0.70,
+            "raw_xgb_direction": "SHORT",
+            "raw_xgb_confidence": 0.70,
             "vol_regime": "NORMAL",
             "allocated_capital": 30000,
             "sqqq_price": 12.50,
             "current_shares": 0,
+            "regime": "RISK_OFF",
+            "pct_above_sma50": -0.05,
+            "roc_slow": -0.03,
         }
         data.update(overrides)
         return data
@@ -159,6 +197,12 @@ class TestCalculateSqqqTargetShares:
             result = calculate_sqqq_target_shares(data)
             assert result["target_shares"] == 0
 
+    def test_sizing_requires_two_bearish_votes(self):
+        data = self._make_sizing_data(raw_xgb_direction="FLAT", raw_xgb_confidence=0.50)
+        result = calculate_sqqq_target_shares(data)
+        assert result["target_shares"] == 0
+        assert "model_agreement" in str(result["limiting_factors"])
+
     def test_sizing_trend_override(self):
         """Non-SHORT k-NN with trend override → conservative sizing."""
         data = self._make_sizing_data(knn_direction="LONG", knn_confidence=0.60)
@@ -188,6 +232,14 @@ class TestCalculateSqqqTargetShares:
             result = calculate_sqqq_target_shares(data)
             assert result["target_shares"] == 0
             assert result["action"] == "EXIT"
+
+    def test_bull_regime_zeroes_inverse_target(self):
+        """Controlling regime policy should keep bull markets out of SQQQ by default."""
+        data = self._make_sizing_data(regime="BULL")
+        result = calculate_sqqq_target_shares(data)
+        assert result["target_shares"] == 0
+        assert result["action"] == "HOLD"
+        assert "regime=BULL" in str(result["limiting_factors"])
 
     def test_hold_when_delta_below_min_trade(self):
         """Small delta → HOLD."""
@@ -222,13 +274,17 @@ class TestSqqqTrendOverrideGate:
         data = {
             "knn_direction": "LONG",
             "knn_confidence": 0.60,
+            "raw_knn_direction": "LONG",
+            "raw_knn_confidence": 0.60,
+            "raw_xgb_direction": "FLAT",
+            "raw_xgb_confidence": 0.50,
             "vol_regime": "NORMAL",
             "allocated_capital": 30000,
             "is_execution_window": True,
             "day_trades_remaining": 5,
             "trading_days_fetched": 278,
             "has_tqqq_position": False,
-            "regime": "BULL",
+            "regime": "RISK_OFF",
             "pct_above_sma50": -0.05,
             "roc_slow": -0.03,
         }
@@ -267,6 +323,8 @@ class TestSqqqTrendOverrideGate:
         """k-NN SHORT path still works even with trend override enabled."""
         data = self._make_gate_data(
             knn_direction="SHORT", knn_confidence=0.65,
+            raw_knn_direction="SHORT", raw_knn_confidence=0.65,
+            raw_xgb_direction="SHORT", raw_xgb_confidence=0.65,
             pct_above_sma50=0.02, roc_slow=0.01,  # no trend signal
         )
         passed, failed = run_sqqq_gate_checklist(data)
@@ -274,19 +332,23 @@ class TestSqqqTrendOverrideGate:
 
 
 class TestSqqqGateRotationBypass:
-    """Test that Gate S8 (mutual_exclusivity) is bypassed during TQQQ→SQQQ rotation."""
+    """Test that Gate S8 can still be bypassed for an explicit, opt-in rotation path."""
 
     def _make_gate_data(self, **overrides):
         data = {
             "knn_direction": "SHORT",
             "knn_confidence": 0.70,
+            "raw_knn_direction": "SHORT",
+            "raw_knn_confidence": 0.70,
+            "raw_xgb_direction": "SHORT",
+            "raw_xgb_confidence": 0.70,
             "vol_regime": "NORMAL",
             "allocated_capital": 30000,
             "is_execution_window": True,
             "day_trades_remaining": 5,
             "trading_days_fetched": 278,
             "has_tqqq_position": True,
-            "regime": "BULL",
+            "regime": "RISK_OFF",
             "tqqq_just_exited": False,
         }
         data.update(overrides)

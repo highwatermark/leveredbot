@@ -1,0 +1,10 @@
+iteration	val_macro_f1	val_balanced_acc	val_accuracy	status	description
+baseline	0.348994	0.364654	0.579228	keep	initial xgb multiclass baseline; best rolling-stability candidate across shifted windows
+extratrees_300	0.370820	0.409826	0.577896	reject_holdout	best validation candidate from model-family sweep; holdout degraded
+extratrees_800_thresholded	0.383479	0.391028	0.671105	keep_fixedfold_only	best validation-only candidate after threshold tuning; not best rolling-stability candidate
+regime_xgb_best	0.336398	0.346732	0.589880	reject_validation	regime-conditioned xgb underperformed fixed-fold winner
+regime_et_best	0.363203	0.370732	0.665779	reject_validation	regime-conditioned extra trees underperformed fixed-fold winner
+regime_hybrid_best	0.372418	0.379608	0.668442	reject_validation	regime-conditioned hybrid underperformed fixed-fold winner
+two_stage_trade_then_side	0.272659	0.371664	0.398136	reject_validation	two-stage trade-vs-cash then TQQQ-vs-SQQQ overtraded and underperformed badly
+two_stage_conservative_sweep	0.288376	0.337149	0.713715	reject_validation	conservative two-stage settings collapsed to almost all CASH and still underperformed on macro F1
+shadow_bearish_v1_training	0.383038	0.415773	0.443409	research_only	stricter shadow bearish label mode improves SQQQ representation but is not a promoted default

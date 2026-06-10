@@ -15,14 +15,19 @@ before switching (except RISK_OFF/BREAKDOWN which take effect immediately).
 from config import LEVERAGE_CONFIG
 
 
-# Regime -> target allocation as percentage of allocated capital
-REGIME_TARGETS = {
-    "STRONG_BULL": LEVERAGE_CONFIG["max_position_pct"],   # 0.70
-    "BULL": 0.50,
-    "CAUTIOUS": 0.25,
-    "RISK_OFF": 0.0,
-    "BREAKDOWN": 0.0,
-}
+def _build_regime_targets() -> dict[str, float]:
+    """Read regime target allocations from config so exposure is tunable without code changes."""
+    return {
+        "STRONG_BULL": LEVERAGE_CONFIG["max_position_pct"],
+        "BULL": LEVERAGE_CONFIG.get("bull_position_pct", 0.15),
+        "CAUTIOUS": LEVERAGE_CONFIG.get("cautious_position_pct", 0.08),
+        "RISK_OFF": 0.0,
+        "BREAKDOWN": 0.0,
+    }
+
+
+# Backwards-compatible exported snapshot; get_regime_target_pct() reads config dynamically.
+REGIME_TARGETS = _build_regime_targets()
 
 
 def detect_regime(
@@ -130,4 +135,4 @@ def get_effective_regime(
 
 def get_regime_target_pct(regime: str) -> float:
     """Map regime to target allocation percentage of allocated capital."""
-    return REGIME_TARGETS.get(regime, 0.0)
+    return _build_regime_targets().get(regime, 0.0)

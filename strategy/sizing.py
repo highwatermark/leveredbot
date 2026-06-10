@@ -20,6 +20,7 @@ from strategy.signals import (
     check_sideways,
     check_rsi_overbought,
 )
+from strategy.sleeves import evaluate_rule_sleeves
 
 
 def get_allocated_capital(
@@ -79,6 +80,62 @@ def get_allocated_capital(
         "allocated_capital": available,
         "cash_available": equity - other_value - strategy_value,
     }
+
+
+def is_sqqq_regime_allowed(regime: str) -> bool:
+    """Return whether inverse exposure is allowed under the current regime policy."""
+    authority = LEVERAGE_CONFIG.get("regime_authority", "controlling")
+    allowed_regimes = set(LEVERAGE_CONFIG.get("inverse_allowed_regimes", ("RISK_OFF", "BREAKDOWN")))
+
+    if regime in allowed_regimes:
+        return True
+    if authority != "controlling":
+        return True
+    if regime == "BULL":
+        return LEVERAGE_CONFIG.get("allow_inverse_in_bull", False)
+    if regime == "STRONG_BULL":
+        return LEVERAGE_CONFIG.get("allow_inverse_in_strong_bull", False)
+    return False
+
+
+def is_sqqq_signal_active(data: dict) -> bool:
+    """Return whether the bearish thesis is active enough to justify SQQQ exposure."""
+    knn_dir = data.get("knn_direction", "FLAT")
+    knn_conf = data.get("knn_confidence", 0.5)
+    min_conf = LEVERAGE_CONFIG.get("sqqq_min_knn_confidence", 0.55)
+
+    if knn_dir == "SHORT" and knn_conf >= min_conf:
+        return True
+
+    if LEVERAGE_CONFIG.get("sqqq_trend_override", False):
+        pct_above_sma50 = data.get("pct_above_sma50", 0)
+        roc_slow = data.get("roc_slow", 0)
+        sma50_thresh = LEVERAGE_CONFIG.get("sqqq_trend_sma50_threshold", -0.03)
+        roc_thresh = LEVERAGE_CONFIG.get("sqqq_trend_roc_threshold", -0.02)
+        return pct_above_sma50 < sma50_thresh and roc_slow < roc_thresh
+
+    return False
+
+
+def get_bearish_model_votes(data: dict) -> int:
+    """Count how many raw models are independently bearish enough for inverse exposure."""
+    votes = 0
+    if data.get("raw_knn_direction", "FLAT") == "SHORT" and data.get("raw_knn_confidence", 0.5) >= LEVERAGE_CONFIG.get("sqqq_min_knn_confidence", 0.55):
+        votes += 1
+    if data.get("raw_xgb_direction", "FLAT") == "SHORT" and data.get("raw_xgb_confidence", 0.5) >= LEVERAGE_CONFIG.get("xgb_min_confidence", 0.55):
+        votes += 1
+    return votes
+
+
+def get_long_model_short_cap_pct(regime: str) -> float | None:
+    """Return capped long exposure when tactical models are bearish in a bullish regime."""
+    if regime == "STRONG_BULL":
+        cap = LEVERAGE_CONFIG.get("long_model_short_strong_bull_max_position_pct", 0.25)
+        return cap if cap and cap > 0 else None
+    if regime == "BULL":
+        cap = LEVERAGE_CONFIG.get("long_model_short_bull_max_position_pct", 0.15)
+        return cap if cap and cap > 0 else None
+    return None
 
 
 def run_gate_checklist(data: dict) -> tuple[bool, list[str]]:
@@ -185,17 +242,22 @@ def run_gate_checklist(data: dict) -> tuple[bool, list[str]]:
     if trading_days < 250:
         failed.append("data_quality")
 
-    # Gate 15: RSI overbought
-    if check_rsi_overbought(closes):
-        failed.append("rsi_overbought")
-
-    # Gate 16: k-NN disagreement (regime bullish but k-NN predicts SHORT with high confidence)
-    if not LEVERAGE_CONFIG.get("knn_report_only", True):
-        knn_dir = data.get("knn_direction", "FLAT")
-        knn_conf = data.get("knn_confidence", 0.5)
-        disagree_threshold = LEVERAGE_CONFIG.get("knn_disagreement_confidence", 0.60)
-        if regime in ("STRONG_BULL", "BULL") and knn_dir == "SHORT" and knn_conf >= disagree_threshold:
-            failed.append("knn_disagreement")
+    # Gate 15: tactical model veto only applies when sleeve engine is disabled.
+    if not LEVERAGE_CONFIG.get("knn_report_only", True) and not LEVERAGE_CONFIG.get("use_rule_sleeves", False):
+        model_dir = data.get("knn_direction", "FLAT")
+        model_conf = data.get("knn_confidence", 0.5)
+        current_shares = data.get("current_shares", 0)
+        disagree_threshold = LEVERAGE_CONFIG.get("long_model_short_block_confidence", 0.58)
+        if regime in ("STRONG_BULL", "BULL") and model_dir == "SHORT" and model_conf >= disagree_threshold:
+            if get_long_model_short_cap_pct(regime) is None:
+                failed.append("model_bearish")
+        elif (
+            regime in ("STRONG_BULL", "BULL")
+            and current_shares == 0
+            and LEVERAGE_CONFIG.get("long_require_model_support_for_new_entries", True)
+            and model_dir == "FLAT"
+        ):
+            failed.append("model_neutral")
 
     return (len(failed) == 0, failed)
 
@@ -240,12 +302,56 @@ def calculate_target_shares(data: dict) -> dict:
     closes = data.get("qqq_closes", [])
     tqqq_price = data.get("tqqq_price", 1)
     current_shares = data.get("current_shares", 0)
+    is_overbought = check_rsi_overbought(closes)
+    model_direction = data.get("model_direction", data.get("knn_direction", "FLAT"))
+    model_confidence = data.get("model_confidence", data.get("knn_confidence", 0.5))
+    model_disagreement = data.get("model_disagreement", False)
 
     limiting_factors = []
 
     # Step 1: Regime target
     regime_pct = get_regime_target_pct(regime)
     target_pct = regime_pct
+
+    if LEVERAGE_CONFIG.get("use_rule_sleeves", False):
+        sleeve_result = evaluate_rule_sleeves(data)
+        target_pct = sleeve_result["bull_target_pct"]
+        limiting_factors.extend([f"sleeve:{s.name}" for s in sleeve_result["bull_sleeves"]])
+        limiting_factors.extend([f"overlay:{name}" for name in sleeve_result["overlays"]])
+
+        if target_pct == 0:
+            limiting_factors.append("cash:no_bull_sleeve")
+        target_value = allocated * target_pct
+        target_shares = max(0, int(target_value / tqqq_price)) if tqqq_price > 0 else 0
+        target_value = target_shares * tqqq_price
+        delta_shares = target_shares - current_shares
+        delta_value = delta_shares * tqqq_price
+
+        min_trade = LEVERAGE_CONFIG["min_trade_value"]
+        if regime in ("RISK_OFF", "BREAKDOWN") and current_shares > 0:
+            action = "EXIT"
+        elif abs(delta_value) < min_trade:
+            action = "HOLD"
+            delta_shares = 0
+            delta_value = 0
+        elif delta_shares > 0:
+            action = "BUY"
+        elif delta_shares < 0:
+            action = "SELL"
+        else:
+            action = "HOLD"
+
+        return {
+            "target_shares": target_shares,
+            "target_value": target_value,
+            "current_shares": current_shares,
+            "delta_shares": delta_shares,
+            "delta_value": delta_value,
+            "action": action,
+            "limiting_factors": limiting_factors,
+            "target_allocation_pct": round(target_pct, 4),
+            "active_sleeves": [s.name for s in sleeve_result["bull_sleeves"]],
+        }
 
     if regime_pct == 0:
         limiting_factors.append(f"regime={regime}")
@@ -286,15 +392,57 @@ def calculate_target_shares(data: dict) -> dict:
             target_pct = min(target_pct, LEVERAGE_CONFIG["min_position_pct"])
             limiting_factors.append("consecutive_down")
 
-        # Step 7: k-NN adjustment (if enabled and not report-only)
+        # Step 7: Overbought handling should reduce aggression, not erase the long sleeve.
+        overbought_action = LEVERAGE_CONFIG.get("overbought_action", "pause_adds")
+        overbought_reduction = LEVERAGE_CONFIG.get("overbought_reduction_pct", 0.75)
+        if is_overbought:
+            if overbought_action == "trim":
+                target_pct *= overbought_reduction
+                limiting_factors.append("rsi_overbought_trim")
+            elif overbought_action == "pause_adds":
+                limiting_factors.append("rsi_overbought_pause_adds")
+                if current_shares == 0:
+                    target_pct *= overbought_reduction
+            elif overbought_action == "block_new_entries" and current_shares == 0:
+                target_pct = 0.0
+                limiting_factors.append("rsi_overbought_block_new")
+
+        # Step 8: k-NN adjustment (if enabled and not report-only)
         knn_adj = data.get("knn_adjustment", 1.0)
         if not LEVERAGE_CONFIG.get("knn_report_only", True) and knn_adj < 1.0:
             target_pct *= knn_adj
             limiting_factors.append(f"knn_adj={knn_adj}")
 
+        # Step 9: Tactical model can move the long sleeve to cash or capped exposure.
+        if model_direction == "SHORT" and model_confidence >= LEVERAGE_CONFIG.get("long_model_short_block_confidence", 0.58):
+            bearish_cap = get_long_model_short_cap_pct(regime)
+            if bearish_cap is None:
+                target_pct = 0.0
+                limiting_factors.append("model_bearish_cash")
+            elif target_pct > bearish_cap:
+                target_pct = bearish_cap
+                limiting_factors.append(f"model_bearish_cap_{regime.lower()}")
+        elif model_direction == "FLAT":
+            if current_shares == 0 and LEVERAGE_CONFIG.get("long_require_model_support_for_new_entries", True):
+                target_pct = 0.0
+                limiting_factors.append("model_neutral_cash")
+            else:
+                max_neutral_pct = LEVERAGE_CONFIG.get("long_neutral_max_position_pct", 0.10)
+                if target_pct > max_neutral_pct:
+                    target_pct = max_neutral_pct
+                    limiting_factors.append("model_neutral_cap")
+        elif model_disagreement:
+            max_disagreement_pct = LEVERAGE_CONFIG.get("long_disagreement_max_position_pct", 0.20)
+            if target_pct > max_disagreement_pct:
+                target_pct = max_disagreement_pct
+                limiting_factors.append("model_disagreement_cap")
+
         # Calculate target value and shares
         target_value = allocated * target_pct
         target_shares = max(0, int(target_value / tqqq_price)) if tqqq_price > 0 else 0
+
+        if is_overbought and overbought_action == "pause_adds" and current_shares > 0:
+            target_shares = min(target_shares, current_shares)
 
     target_value = target_shares * tqqq_price
     delta_shares = target_shares - current_shares
@@ -345,28 +493,21 @@ def run_sqqq_gate_checklist(data: dict) -> tuple[bool, list[str]]:
     """
     failed = []
 
+    if LEVERAGE_CONFIG.get("use_rule_sleeves", False):
+        sleeve_result = evaluate_rule_sleeves(data)
+        if sleeve_result["bear_target_pct"] <= 0:
+            failed.append("sleeves_inactive")
     # Signal gates: k-NN path OR trend override path
     knn_dir = data.get("knn_direction", "FLAT")
     knn_conf = data.get("knn_confidence", 0.5)
     min_conf = LEVERAGE_CONFIG.get("sqqq_min_knn_confidence", 0.55)
 
-    knn_path = (knn_dir == "SHORT" and knn_conf >= min_conf)
-
-    # Trend override: QQQ deeply below SMA-50 with negative momentum
-    trend_override = False
-    if LEVERAGE_CONFIG.get("sqqq_trend_override", False):
-        pct_above_sma50 = data.get("pct_above_sma50", 0)
-        roc_slow = data.get("roc_slow", 0)
-        sma50_thresh = LEVERAGE_CONFIG.get("sqqq_trend_sma50_threshold", -0.03)
-        roc_thresh = LEVERAGE_CONFIG.get("sqqq_trend_roc_threshold", -0.02)
-        trend_override = (pct_above_sma50 < sma50_thresh and roc_slow < roc_thresh)
-
-    if not knn_path and not trend_override:
+    if not LEVERAGE_CONFIG.get("use_rule_sleeves", False) and not is_sqqq_signal_active(data):
         if knn_dir != "SHORT":
             failed.append("knn_not_short")
         if knn_conf < min_conf:
             failed.append("knn_confidence")
-        if LEVERAGE_CONFIG.get("sqqq_trend_override", False) and not trend_override:
+        if LEVERAGE_CONFIG.get("sqqq_trend_override", False):
             failed.append("trend_override")
 
     # Gate S3: Volatility not EXTREME
@@ -398,10 +539,17 @@ def run_sqqq_gate_checklist(data: dict) -> tuple[bool, list[str]]:
     if data.get("has_tqqq_position", False) and not data.get("tqqq_just_exited", False):
         failed.append("mutual_exclusivity")
 
-    # Gate S9: Not in RISK_OFF or BREAKDOWN regime
+    # Gate S9: Regime policy must permit inverse exposure
     regime = data.get("regime", "RISK_OFF")
-    if regime in ("RISK_OFF", "BREAKDOWN"):
-        failed.append("regime_risk_off")
+    if not is_sqqq_regime_allowed(regime):
+        failed.append("regime_not_inverse")
+
+    bearish_votes = get_bearish_model_votes(data)
+    min_votes = LEVERAGE_CONFIG.get("sqqq_min_bearish_model_votes", 2)
+    if not is_sqqq_signal_active(data):
+        pass
+    elif not LEVERAGE_CONFIG.get("use_rule_sleeves", False) and data.get("knn_direction", "FLAT") == "SHORT" and bearish_votes < min_votes:
+        failed.append("model_agreement")
 
     return (len(failed) == 0, failed)
 
@@ -428,17 +576,60 @@ def calculate_sqqq_target_shares(data: dict) -> dict:
     allocated = data.get("allocated_capital", 0)
     sqqq_price = data.get("sqqq_price", 1)
     current_shares = data.get("current_shares", 0)
+    bearish_votes = get_bearish_model_votes(data)
+    min_votes = LEVERAGE_CONFIG.get("sqqq_min_bearish_model_votes", 2)
 
     max_pct = LEVERAGE_CONFIG.get("sqqq_max_position_pct", 0.40)
     min_conf = LEVERAGE_CONFIG.get("sqqq_min_knn_confidence", 0.55)
     limiting_factors = []
+    regime = data.get("regime", "RISK_OFF")
 
+    if LEVERAGE_CONFIG.get("use_rule_sleeves", False):
+        sleeve_result = evaluate_rule_sleeves(data)
+        target_pct = sleeve_result["bear_target_pct"]
+        limiting_factors.extend([f"sleeve:{s.name}" for s in sleeve_result["bear_sleeves"]])
+        if target_pct == 0:
+            limiting_factors.append(f"regime={regime}")
+        target_value = allocated * target_pct
+        target_shares = max(0, int(target_value / sqqq_price)) if sqqq_price > 0 else 0
+        target_value = target_shares * sqqq_price
+        delta_shares = target_shares - current_shares
+        delta_value = delta_shares * sqqq_price
+
+        min_trade = LEVERAGE_CONFIG["min_trade_value"]
+        if target_shares == 0 and current_shares > 0:
+            action = "EXIT"
+        elif abs(delta_value) < min_trade:
+            action = "HOLD"
+            delta_shares = 0
+            delta_value = 0
+        elif delta_shares > 0:
+            action = "BUY"
+        elif delta_shares < 0:
+            action = "SELL"
+        else:
+            action = "HOLD"
+
+        return {
+            "symbol": "SQQQ",
+            "target_shares": target_shares,
+            "target_value": target_value,
+            "current_shares": current_shares,
+            "delta_shares": delta_shares,
+            "delta_value": delta_value,
+            "action": action,
+            "limiting_factors": limiting_factors,
+            "target_allocation_pct": round(target_pct, 4),
+            "active_sleeves": [s.name for s in sleeve_result["bear_sleeves"]],
+        }
+
+    if not is_sqqq_regime_allowed(regime):
+        target_pct = 0.0
+        limiting_factors.append(f"regime={regime}")
     # Step 1: Determine sizing path
     # Path A: k-NN SHORT with sufficient confidence → confidence-driven sizing
     # Path B: Trend override (no k-NN SHORT) → conservative fixed sizing
-    knn_path = (knn_dir == "SHORT" and knn_conf >= min_conf)
-
-    if knn_path:
+    elif knn_dir == "SHORT" and knn_conf >= min_conf and bearish_votes >= min_votes:
         # Confidence-driven: min_conf → 50% of max, 0.80+ → 100% of max
         if knn_conf >= 0.80:
             target_pct = max_pct
@@ -446,7 +637,12 @@ def calculate_sqqq_target_shares(data: dict) -> dict:
             scale = (knn_conf - min_conf) / (0.80 - min_conf)
             target_pct = max_pct * (0.5 + 0.5 * scale)
             limiting_factors.append(f"knn_conf={knn_conf:.2f}")
-    elif LEVERAGE_CONFIG.get("sqqq_trend_override", False):
+        limiting_factors.append(f"bearish_votes={bearish_votes}")
+    elif knn_dir == "SHORT" and knn_conf >= min_conf:
+        target_pct = 0.0
+        limiting_factors.append(f"bearish_votes={bearish_votes}")
+        limiting_factors.append("model_agreement")
+    elif is_sqqq_signal_active(data):
         # Trend override: conservative fraction of max allocation
         trend_frac = LEVERAGE_CONFIG.get("sqqq_trend_position_pct", 0.30)
         target_pct = max_pct * trend_frac

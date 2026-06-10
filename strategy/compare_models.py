@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 from collections import defaultdict
+from sklearn.metrics import roc_auc_score, roc_curve
 
 from strategy.knn_signal import KNNSignal, FeatureCalculator
 from strategy.xgb_signal import XGBSignal
@@ -137,6 +138,7 @@ def _compute_metrics(predictions: list[tuple[int, int, float]]) -> dict:
     preds = [p for p, _, _ in predictions]
     actuals = [a for _, a, _ in predictions]
     confs = [c for _, _, c in predictions]
+    positive_scores = [c if p == 1 else 1 - c for p, _, c in predictions]
 
     n = len(predictions)
     correct = sum(1 for p, a in zip(preds, actuals) if p == a)
@@ -169,6 +171,8 @@ def _compute_metrics(predictions: list[tuple[int, int, float]]) -> dict:
         "class_balance": up_total / n if n > 0 else 0,
         "pred_balance": sum(preds) / n if n > 0 else 0,
         "avg_confidence": float(np.mean(confs)),
+        "roc_auc": float(roc_auc_score(actuals, positive_scores)) if len(set(actuals)) > 1 else 0.5,
+        "roc_curve": roc_curve(actuals, positive_scores) if len(set(actuals)) > 1 else None,
     }
 
 
@@ -195,6 +199,7 @@ def _print_results(results: dict, xgb_model: XGBSignal):
 
     metrics = [
         ("Accuracy", "accuracy"),
+        ("ROC AUC", "roc_auc"),
         ("Precision (up)", "precision_up"),
         ("Recall (up)", "recall_up"),
         ("F1 (up)", "f1_up"),
@@ -212,6 +217,14 @@ def _print_results(results: dict, xgb_model: XGBSignal):
         else:
             winner = "k-NN" if kv > xv + 0.001 else ("XGBoost" if xv > kv + 0.001 else "TIE")
         print(f"  {label:<23} {kv:>9.1%} {xv:>9.1%} {winner:>10}")
+
+    for name, metrics_dict in (("k-NN", knn_m), ("XGBoost", xgb_m)):
+        roc = metrics_dict.get("roc_curve")
+        if roc is not None:
+            fpr, tpr, thresholds = roc
+            print(f"\n{name} ROC samples:")
+            for idx in np.linspace(0, len(fpr) - 1, num=min(5, len(fpr)), dtype=int):
+                print(f"  threshold={thresholds[idx]:.3f}  fpr={fpr[idx]:.3f}  tpr={tpr[idx]:.3f}")
 
     # XGBoost feature importances
     importances = xgb_model.get_feature_importance()

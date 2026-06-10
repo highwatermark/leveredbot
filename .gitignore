@@ -10,3 +10,5 @@ logs/*.log
 *.egg-info/
 dist/
 build/
+*.db-shm
+*.db-wal

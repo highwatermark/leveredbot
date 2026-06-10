@@ -16,6 +16,7 @@ Usage:
 import sys
 import logging
 import json
+import importlib.util
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
@@ -53,6 +54,274 @@ def _calc_day_trades_remaining(account: dict) -> int:
         return 999  # Unlimited for PDT accounts above $25K
     used = account.get("daytrade_count", 0)
     return max(0, 3 - used)
+
+
+def _resolve_model_signal(
+    knn_direction: str,
+    knn_confidence: float,
+    knn_adjustment: float,
+    xgb_direction: str,
+    xgb_confidence: float,
+    xgb_adjustment: float,
+) -> dict:
+    """Arbitrate raw model outputs into a single effective model signal."""
+    primary = LEVERAGE_CONFIG.get("model_primary", "knn")
+    disagreement_action = LEVERAGE_CONFIG.get("model_disagreement_action", "reduce")
+    disagreement_adj = LEVERAGE_CONFIG.get("model_disagreement_adjustment", 0.75)
+
+    knn_active = knn_direction != "FLAT"
+    xgb_active = xgb_direction != "FLAT"
+
+    if not knn_active and not xgb_active:
+        return {
+            "direction": "FLAT",
+            "confidence": max(knn_confidence, xgb_confidence),
+            "adjustment": 1.0,
+            "source": "neutral",
+            "disagreement": False,
+        }
+
+    if knn_active and xgb_active and knn_direction == xgb_direction:
+        return {
+            "direction": knn_direction,
+            "confidence": round(max(knn_confidence, xgb_confidence), 4),
+            "adjustment": round(min(knn_adjustment, xgb_adjustment), 4),
+            "source": "agreement",
+            "disagreement": False,
+        }
+
+    if knn_active and not xgb_active:
+        return {
+            "direction": knn_direction,
+            "confidence": round(knn_confidence, 4),
+            "adjustment": round(min(1.0, knn_adjustment * disagreement_adj), 4),
+            "source": "knn_only",
+            "disagreement": True,
+        }
+
+    if xgb_active and not knn_active:
+        return {
+            "direction": xgb_direction,
+            "confidence": round(xgb_confidence, 4),
+            "adjustment": round(min(1.0, xgb_adjustment * disagreement_adj), 4),
+            "source": "xgb_only",
+            "disagreement": True,
+        }
+
+    if disagreement_action == "flat":
+        return {
+            "direction": "FLAT",
+            "confidence": round(max(knn_confidence, xgb_confidence), 4),
+            "adjustment": 1.0,
+            "source": "conflict_flat",
+            "disagreement": True,
+        }
+
+    # Opposite directional calls default to neutralized risk under "reduce" as well.
+    primary_direction = knn_direction if primary == "knn" else xgb_direction
+    primary_confidence = knn_confidence if primary == "knn" else xgb_confidence
+    return {
+        "direction": "FLAT",
+        "confidence": round(primary_confidence, 4),
+        "adjustment": 1.0,
+        "source": f"conflict_{primary_direction.lower()}",
+        "disagreement": True,
+    }
+
+
+def _backtest_portfolio_value(
+    cash: float,
+    tqqq_shares: int,
+    sqqq_shares: int,
+    tqqq_price: float,
+    sqqq_price: float,
+) -> float:
+    """Mark the sleeve at a specific price snapshot."""
+    return cash + (tqqq_shares * tqqq_price) + (sqqq_shares * sqqq_price)
+
+
+def _backtest_holding_days(entry_date: str | None, current_date: str) -> int:
+    """Return holding days for backtest position state."""
+    if not entry_date:
+        return 0
+    try:
+        return max(0, (date.fromisoformat(current_date) - date.fromisoformat(entry_date)).days)
+    except ValueError:
+        return 0
+
+
+def _build_backtest_position_state(
+    symbol: str,
+    shares: int,
+    meta: dict,
+    bar: dict,
+    prev_bar: dict | None,
+    current_price: float,
+    current_date: str,
+):
+    """Construct a PositionState from historical bars for pure PM checks."""
+    from strategy.position_manager import PositionState
+
+    avg_entry_price = meta.get("avg_entry_price", 0.0)
+    unrealized_pnl_pct = ((current_price - avg_entry_price) / avg_entry_price) if avg_entry_price > 0 else 0.0
+    prev_close = prev_bar["close"] if prev_bar else bar["open"]
+
+    return PositionState(
+        symbol=symbol,
+        shares=shares,
+        avg_entry_price=avg_entry_price,
+        current_price=current_price,
+        market_value=shares * current_price,
+        unrealized_pnl_pct=unrealized_pnl_pct,
+        entry_date=meta.get("entry_date"),
+        holding_days=_backtest_holding_days(meta.get("entry_date"), current_date),
+        intraday_high=bar["high"],
+        intraday_low=bar["low"],
+        intraday_open=bar["open"],
+        prev_close=prev_close,
+        overnight_gap_pct=((bar["open"] - prev_close) / prev_close) if prev_close > 0 else 0.0,
+        intraday_change_pct=((current_price - bar["open"]) / bar["open"]) if bar["open"] > 0 else 0.0,
+        intraday_drawdown_pct=((bar["high"] - current_price) / bar["high"]) if bar["high"] > 0 else 0.0,
+    )
+
+
+def _reset_backtest_position(meta: dict) -> None:
+    """Reset per-position bookkeeping after a full exit."""
+    meta["avg_entry_price"] = 0.0
+    meta["entry_date"] = None
+    meta["high_watermark"] = 0.0
+    meta["tiers_taken"] = []
+    meta["gate_fail_streak"] = 0
+
+
+def _apply_backtest_trade(
+    symbol: str,
+    delta_shares: int,
+    fill_price: float,
+    current_date: str,
+    cash: float,
+    share_map: dict,
+    meta_map: dict,
+) -> tuple[float, bool]:
+    """Apply a simulated fill and update per-position state."""
+    if delta_shares == 0:
+        return cash, False
+
+    shares_before = share_map[symbol]
+    meta = meta_map[symbol]
+
+    if delta_shares > 0:
+        cost = delta_shares * fill_price
+        if cost > cash:
+            affordable = int(cash / fill_price) if fill_price > 0 else 0
+            if affordable <= 0:
+                return cash, False
+            delta_shares = affordable
+            cost = delta_shares * fill_price
+
+        total_cost_before = shares_before * meta.get("avg_entry_price", 0.0)
+        new_shares = shares_before + delta_shares
+        meta["avg_entry_price"] = ((total_cost_before + cost) / new_shares) if new_shares > 0 else 0.0
+        if shares_before == 0:
+            meta["entry_date"] = current_date
+            meta["tiers_taken"] = []
+            meta["gate_fail_streak"] = 0
+            meta["high_watermark"] = fill_price
+        else:
+            meta["high_watermark"] = max(meta.get("high_watermark", 0.0), fill_price)
+
+        share_map[symbol] = new_shares
+        cash -= cost
+        return cash, True
+
+    shares_to_sell = min(shares_before, abs(delta_shares))
+    if shares_to_sell <= 0:
+        return cash, False
+
+    cash += shares_to_sell * fill_price
+    remaining = shares_before - shares_to_sell
+    share_map[symbol] = remaining
+    if remaining <= 0:
+        _reset_backtest_position(meta)
+    return cash, True
+
+
+def _run_backtest_morning_window(
+    pm,
+    symbol: str,
+    shares: int,
+    meta: dict,
+    bar: dict,
+    prev_bar: dict | None,
+    qqq_bar: dict,
+    prev_equity: float,
+    sma_250: float,
+    current_date: str,
+) -> tuple[object | None, float]:
+    """Mirror morning PM checks using daily open as the 9:35 snapshot."""
+    if shares <= 0:
+        return None, prev_equity
+
+    state = _build_backtest_position_state(symbol, shares, meta, bar, prev_bar, bar["open"], current_date)
+    account_equity = prev_equity + ((bar["open"] - (prev_bar["close"] if prev_bar else bar["open"])) * shares)
+    daily_loss = pm.check_daily_loss_limit(account_equity, prev_equity)
+    if daily_loss.should_exit:
+        daily_loss.shares_to_sell = shares
+        return daily_loss, bar["open"]
+
+    candidates = [
+        pm.check_gap_down(state),
+        pm.check_stop_loss(state),
+        pm.check_regime_emergency(state, qqq_bar["open"], sma_250),
+    ]
+    decision = pm._select_decision([c for c in candidates if c.should_exit])
+    if decision:
+        decision.shares_to_sell = decision.shares_to_sell or shares
+    return decision, bar["open"]
+
+
+def _run_backtest_midday_window(
+    pm,
+    symbol: str,
+    shares: int,
+    meta: dict,
+    bar: dict,
+    prev_bar: dict | None,
+    prev_volume: float,
+    prev_equity: float,
+    current_date: str,
+) -> tuple[object | None, float, float | None]:
+    """Mirror midday PM checks using low for defensive exits and high for profit tiers."""
+    if shares <= 0:
+        return None, prev_equity, None
+
+    adverse_price = bar["low"]
+    account_equity = prev_equity + ((adverse_price - (prev_bar["close"] if prev_bar else bar["open"])) * shares)
+    daily_loss = pm.check_daily_loss_limit(account_equity, prev_equity)
+    if daily_loss.should_exit:
+        daily_loss.shares_to_sell = shares
+        return daily_loss, adverse_price, None
+
+    meta["high_watermark"] = max(meta.get("high_watermark", 0.0), bar["high"])
+    adverse_state = _build_backtest_position_state(symbol, shares, meta, bar, prev_bar, adverse_price, current_date)
+    full_exits = [
+        pm.check_stop_loss(adverse_state),
+        pm.check_trailing_stop(adverse_state, meta.get("high_watermark", adverse_state.avg_entry_price)),
+        pm.check_vol_spike(adverse_state, bar["volume"], prev_volume),
+        pm.check_max_hold_period(adverse_state),
+    ]
+    decision = pm._select_decision([c for c in full_exits if c.should_exit])
+    if decision:
+        decision.shares_to_sell = decision.shares_to_sell or shares
+        return decision, adverse_price, None
+
+    if pm.cfg.get("pm_profit_taking_enabled", True):
+        favorable_state = _build_backtest_position_state(symbol, shares, meta, bar, prev_bar, bar["high"], current_date)
+        profit = pm.check_partial_profit(favorable_state, meta.get("tiers_taken", []))
+        if profit.should_exit:
+            return profit, bar["high"], profit.shares_to_sell
+
+    return None, adverse_price, None
 
 
 def _fetch_all_data(use_cache: bool = True, conn=None) -> "MarketData":
@@ -288,34 +557,43 @@ def _compute_signals(data: "MarketData", conn=None) -> "StrategySignals":
                         knn_probabilities = knn_result["probabilities"]
                     logger.info(f"k-NN: {knn_result['direction']} (conf={knn_result['confidence']:.2f}, adj={knn_result['adjustment']}, P(down)={knn_result['probabilities'][0]:.2f}, P(up)={knn_result['probabilities'][1]:.2f})")
 
-            # Run XGBoost if selected
-            if prediction_model in ("xgb", "both"):
-                from strategy.xgb_signal import XGBSignal
-                xgb_model_path = Path(__file__).parent / LEVERAGE_CONFIG.get("xgb_model_path", "data/xgb_model.pkl")
-                xgb = XGBSignal()
-                loaded = False
-                if xgb_model_path.exists():
-                    loaded = xgb.load(xgb_model_path)
-                if not loaded and len(data.qqq_bars) >= 400:
-                    xgb.fit_from_bars(data.qqq_bars, vix_by_date=vix_by_date, cross_asset_bars=cross_bars, microstructure_by_date=micro_data)
-                    xgb.save(xgb_model_path)
-                if xgb.is_fitted:
-                    xgb_result = xgb.predict(data.qqq_bars, vix_by_date=vix_by_date, cross_asset_bars=cross_bars, microstructure_by_date=micro_data)
-                    # Always capture XGB results separately
-                    xgb_direction = xgb_result["direction"]
-                    xgb_confidence = xgb_result["confidence"]
-                    xgb_adjustment = xgb_result["adjustment"]
-                    xgb_probabilities = xgb_result["probabilities"]
-                    # When "xgb" is primary, also use its result for sizing
-                    if prediction_model == "xgb":
-                        knn_direction = xgb_result["direction"]
-                        knn_confidence = xgb_result["confidence"]
-                        knn_adjustment = xgb_result["adjustment"]
-                        knn_probabilities = xgb_result["probabilities"]
-                    logger.info(f"XGBoost: {xgb_direction} (conf={xgb_confidence:.2f}, adj={xgb_adjustment}, P(down)={xgb_probabilities[0]:.2f}, P(up)={xgb_probabilities[1]:.2f})")
+            # Run XGBoost if selected and available in the environment
+            should_run_xgb = (
+                LEVERAGE_CONFIG.get("use_xgb_signal", True)
+                and prediction_model in ("xgb", "both")
+            )
+            if should_run_xgb:
+                if importlib.util.find_spec("xgboost") is None:
+                    logger.warning("xgboost not installed; skipping XGBoost signal")
+                else:
+                    from strategy.xgb_signal import XGBSignal
+                    xgb_model_path = Path(__file__).parent / LEVERAGE_CONFIG.get("xgb_model_path", "data/xgb_model.pkl")
+                    xgb = XGBSignal()
+                    loaded = False
+                    if xgb_model_path.exists():
+                        loaded = xgb.load(xgb_model_path)
+                    if not loaded and len(data.qqq_bars) >= 400:
+                        xgb.fit_from_bars(data.qqq_bars, vix_by_date=vix_by_date, cross_asset_bars=cross_bars, microstructure_by_date=micro_data)
+                        xgb.save(xgb_model_path)
+                    if xgb.is_fitted:
+                        xgb_result = xgb.predict(data.qqq_bars, vix_by_date=vix_by_date, cross_asset_bars=cross_bars, microstructure_by_date=micro_data)
+                        xgb_direction = xgb_result["direction"]
+                        xgb_confidence = xgb_result["confidence"]
+                        xgb_adjustment = xgb_result["adjustment"]
+                        xgb_probabilities = xgb_result["probabilities"]
+                        logger.info(f"XGBoost: {xgb_direction} (conf={xgb_confidence:.2f}, adj={xgb_adjustment}, P(down)={xgb_probabilities[0]:.2f}, P(up)={xgb_probabilities[1]:.2f})")
 
         except Exception as e:
             logger.warning(f"Prediction model signal failed, using neutral: {e}")
+
+    effective_model = _resolve_model_signal(
+        knn_direction,
+        knn_confidence,
+        knn_adjustment,
+        xgb_direction,
+        xgb_confidence,
+        xgb_adjustment,
+    )
 
     return StrategySignals(
         qqq_close=qqq_close,
@@ -359,6 +637,11 @@ def _compute_signals(data: "MarketData", conn=None) -> "StrategySignals":
         xgb_confidence=xgb_confidence,
         xgb_adjustment=xgb_adjustment,
         xgb_probabilities=xgb_probabilities,
+        model_direction=effective_model["direction"],
+        model_confidence=effective_model["confidence"],
+        model_adjustment=effective_model["adjustment"],
+        model_source=effective_model["source"],
+        model_disagreement=effective_model["disagreement"],
     )
 
 
@@ -394,8 +677,9 @@ def _build_gate_data(signals: "StrategySignals", is_half_day: bool = False) -> d
         "options_flow_bearish": signals.options_flow_bearish,
         "options_flow_ratio": signals.options_flow_ratio,
         "trading_days_fetched": signals.trading_days_fetched,
-        "knn_direction": signals.knn_direction,
-        "knn_confidence": signals.knn_confidence,
+        "current_shares": signals.current_shares,
+        "knn_direction": signals.model_direction,
+        "knn_confidence": signals.model_confidence,
     }
 
 
@@ -409,18 +693,23 @@ def _build_sizing_data(signals: "StrategySignals") -> dict:
         "options_flow_adjustment": signals.options_flow_adjustment,
         "qqq_close": signals.qqq_close,
         "sma_50": signals.sma_50,
+        "sma_250": signals.sma_250,
         "qqq_closes": signals.qqq_closes,
         "tqqq_price": signals.tqqq_price,
         "current_shares": signals.current_shares,
-        "knn_adjustment": signals.knn_adjustment,
+        "model_direction": signals.model_direction,
+        "model_confidence": signals.model_confidence,
+        "model_disagreement": signals.model_disagreement,
+        "knn_adjustment": signals.model_adjustment,
+        "daily_loss_pct": signals.daily_loss_pct,
     }
 
 
 def _build_sqqq_gate_data(signals: "StrategySignals", is_half_day: bool = False, tqqq_just_exited: bool = False) -> dict:
     """Build the SQQQ gate checklist input dict from computed signals."""
     return {
-        "knn_direction": signals.knn_direction,
-        "knn_confidence": signals.knn_confidence,
+        "knn_direction": signals.model_direction,
+        "knn_confidence": signals.model_confidence,
         "vol_regime": signals.vol_regime,
         "allocated_capital": signals.allocated_capital,
         "is_execution_window": _is_execution_window(is_half_day),
@@ -429,21 +718,48 @@ def _build_sqqq_gate_data(signals: "StrategySignals", is_half_day: bool = False,
         "has_tqqq_position": signals.has_tqqq_position,
         "regime": signals.effective_regime,
         "tqqq_just_exited": tqqq_just_exited,
+        "qqq_close": signals.qqq_close,
+        "sma_50": signals.sma_50,
+        "sma_250": signals.sma_250,
+        "qqq_closes": signals.qqq_closes,
+        "daily_loss_pct": signals.daily_loss_pct,
+        "model_direction": signals.model_direction,
+        "model_confidence": signals.model_confidence,
+        "model_disagreement": signals.model_disagreement,
         # Trend override fields
         "pct_above_sma50": signals.pct_above_sma50,
         "roc_slow": signals.momentum.get("roc_slow", 0),
+        "raw_knn_direction": signals.knn_direction,
+        "raw_knn_confidence": signals.knn_confidence,
+        "raw_xgb_direction": signals.xgb_direction,
+        "raw_xgb_confidence": signals.xgb_confidence,
     }
 
 
 def _build_sqqq_sizing_data(signals: "StrategySignals") -> dict:
     """Build the SQQQ sizing calculation input dict from computed signals."""
     return {
-        "knn_direction": signals.knn_direction,
-        "knn_confidence": signals.knn_confidence,
+        "knn_direction": signals.model_direction,
+        "knn_confidence": signals.model_confidence,
         "vol_regime": signals.vol_regime,
         "allocated_capital": signals.allocated_capital,
         "sqqq_price": signals.sqqq_price,
         "current_shares": signals.sqqq_current_shares,
+        "regime": signals.effective_regime,
+        "qqq_close": signals.qqq_close,
+        "sma_50": signals.sma_50,
+        "sma_250": signals.sma_250,
+        "qqq_closes": signals.qqq_closes,
+        "daily_loss_pct": signals.daily_loss_pct,
+        "model_direction": signals.model_direction,
+        "model_confidence": signals.model_confidence,
+        "model_disagreement": signals.model_disagreement,
+        "pct_above_sma50": signals.pct_above_sma50,
+        "roc_slow": signals.momentum.get("roc_slow", 0),
+        "raw_knn_direction": signals.knn_direction,
+        "raw_knn_confidence": signals.knn_confidence,
+        "raw_xgb_direction": signals.xgb_direction,
+        "raw_xgb_confidence": signals.xgb_confidence,
     }
 
 
@@ -772,9 +1088,26 @@ def _already_traded_today(conn=None, symbol: str | None = None) -> bool:
 
 def cmd_run(halfday_check: bool = False):
     """Execute the daily strategy pipeline."""
-    from strategy.sizing import run_gate_checklist, calculate_target_shares, run_sqqq_gate_checklist, calculate_sqqq_target_shares
+    from strategy.sizing import (
+        run_gate_checklist,
+        calculate_target_shares,
+        run_sqqq_gate_checklist,
+        calculate_sqqq_target_shares,
+        is_sqqq_regime_allowed,
+        is_sqqq_signal_active,
+    )
     from strategy.executor import execute_rebalance
-    from db.models import get_connection, init_tables, log_daily_decision, update_decision, log_regime_change, log_daily_performance, get_today_pregame
+    from db.models import (
+        get_connection,
+        init_tables,
+        log_daily_decision,
+        update_decision,
+        log_regime_change,
+        log_daily_performance,
+        get_today_pregame,
+        get_latest_performance,
+        get_first_performance,
+    )
     import alpaca_client
     import notifications
 
@@ -887,13 +1220,14 @@ def cmd_run(halfday_check: bool = False):
                 target["delta_shares"] = -signals.current_shares
                 target["delta_value"] = -signals.current_shares * signals.tqqq_price
 
-        # Rotation detection: TQQQ → SQQQ when k-NN says SHORT with high confidence
+        # Direct bull->inverse rotation is disabled by default under a controlling regime.
         wants_rotation_to_sqqq = (
             LEVERAGE_CONFIG.get("use_sqqq_trading", False)
+            and LEVERAGE_CONFIG.get("allow_tqqq_to_sqqq_rotation", False)
             and signals.has_tqqq_position
             and signals.knn_direction == "SHORT"
             and signals.knn_confidence >= LEVERAGE_CONFIG.get("sqqq_min_knn_confidence", 0.60)
-            and signals.effective_regime not in ("RISK_OFF", "BREAKDOWN")
+            and is_sqqq_regime_allowed(signals.effective_regime)
         )
         if wants_rotation_to_sqqq:
             logger.info(f"ROTATION: k-NN SHORT (conf={signals.knn_confidence:.2f}) — "
@@ -1010,26 +1344,25 @@ def cmd_run(halfday_check: bool = False):
         sqqq_order_shares = 0
         sqqq_execution_result = {"executed": False, "action": "HOLD"}
 
-        # Track if TQQQ was just exited (for rotation)
-        tqqq_just_exited = (
-            wants_rotation_to_sqqq
-            and execution_result.get("executed", False)
-        )
+        # Rotation remains an explicit opt-in policy; default path never bypasses mutual exclusivity.
+        tqqq_just_exited = wants_rotation_to_sqqq and execution_result.get("executed", False)
 
         if LEVERAGE_CONFIG.get("use_sqqq_trading", False):
-            # Pass tqqq_just_exited so Gate S8 (mutual_exclusivity) is bypassed after rotation
             sqqq_gate_data = _build_sqqq_gate_data(signals, data.is_half_day, tqqq_just_exited=tqqq_just_exited)
             sqqq_gates_passed, sqqq_gates_failed = run_sqqq_gate_checklist(sqqq_gate_data)
             sqqq_target = calculate_sqqq_target_shares(_build_sqqq_sizing_data(signals))
             logger.info(f"SQQQ gates: {'PASS' if sqqq_gates_passed else 'FAIL'} ({sqqq_gates_failed})")
             logger.info(f"SQQQ target: {sqqq_target['target_shares']} shares ({sqqq_target['action']})")
 
+            regime_allows_sqqq = is_sqqq_regime_allowed(signals.effective_regime)
+            signal_supports_sqqq = is_sqqq_signal_active(sqqq_gate_data)
+
             # Phase 1: SQQQ EXIT (runs first, before any TQQQ entry)
-            # Exit if: holding SQQQ AND (k-NN no longer SHORT, or RISK_OFF/BREAKDOWN, or TQQQ gates pass)
+            # Exit if the bearish thesis no longer holds, inverse regime is disallowed, or the long sleeve is valid.
             if signals.sqqq_current_shares > 0:
                 should_exit_sqqq = (
-                    signals.knn_direction != "SHORT"
-                    or signals.effective_regime in ("RISK_OFF", "BREAKDOWN")
+                    not regime_allows_sqqq
+                    or not signal_supports_sqqq
                     or gates_passed  # TQQQ gates pass → rotate to TQQQ
                 )
                 if should_exit_sqqq:
@@ -1045,7 +1378,7 @@ def cmd_run(halfday_check: bool = False):
                     logger.info(f"SQQQ exit: {sqqq_execution_result['reason']}")
 
             # Phase 2: SQQQ ENTRY (runs last, after TQQQ execution)
-            # Enter if: gates pass AND (no TQQQ position OR just exited TQQQ for rotation)
+            # Enter only when inverse regime is valid and no long sleeve is being opened this cycle.
             elif (sqqq_gates_passed
                   and (not signals.has_tqqq_position or tqqq_just_exited)
                   and not (will_trade and target["action"] == "BUY")
@@ -1120,8 +1453,33 @@ def cmd_run(halfday_check: bool = False):
         tqqq_val = data.tqqq_position["market_value"] if data.tqqq_position else 0
         tqqq_pnl = data.tqqq_position["unrealized_pl"] if data.tqqq_position else 0
         sqqq_val = data.sqqq_position["market_value"] if data.sqqq_position else 0
+        strategy_equity = signals.account_equity - signals.capital["other_positions_value"]
+        prev_perf = get_latest_performance(conn)
+        first_perf = get_first_performance(conn)
+        strategy_pnl_day = strategy_equity - prev_perf["strategy_equity"] if prev_perf else 0.0
+        strategy_anchor = first_perf["strategy_equity"] if first_perf and first_perf.get("strategy_equity") else strategy_equity
+        strategy_total_return_pct = (
+            ((strategy_equity / strategy_anchor) - 1) * 100
+            if strategy_anchor > 0 else 0.0
+        )
+
+        benchmark_qqq_pct = 0.0
+        try:
+            benchmark_anchor_row = conn.execute(
+                "SELECT qqq_close FROM decisions WHERE symbol='TQQQ' ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+            benchmark_anchor = benchmark_anchor_row["qqq_close"] if benchmark_anchor_row else None
+            if benchmark_anchor and benchmark_anchor > 0:
+                benchmark_qqq_pct = ((signals.qqq_close / benchmark_anchor) - 1) * 100
+        except Exception:
+            benchmark_qqq_pct = 0.0
+
         perf = {
             "date": today_et,
+            "account_equity": signals.account_equity,
+            "other_positions_value": signals.capital["other_positions_value"],
+            "strategy_equity": strategy_equity,
+            "strategy_pnl_day": strategy_pnl_day,
             "tqqq_shares": signals.current_shares,
             "tqqq_avg_cost": data.tqqq_position["avg_entry_price"] if data.tqqq_position else 0,
             "tqqq_current_price": signals.tqqq_price,
@@ -1132,8 +1490,8 @@ def cmd_run(halfday_check: bool = False):
             "regime": signals.effective_regime,
             "allocated_capital": signals.allocated_capital,
             "realized_vol": signals.realized_vol,
-            "benchmark_qqq_pct": 0,  # Computed over time
-            "strategy_total_return_pct": 0,
+            "benchmark_qqq_pct": benchmark_qqq_pct,
+            "strategy_total_return_pct": strategy_total_return_pct,
             "sqqq_shares": signals.sqqq_current_shares,
             "sqqq_position_value": sqqq_val,
             "sqqq_pnl_pct": data.sqqq_position["unrealized_plpc"] * 100 if data.sqqq_position else 0,
@@ -1178,6 +1536,9 @@ def cmd_run(halfday_check: bool = False):
             "current_shares": signals.current_shares,
             "tqqq_position_value": tqqq_val,
             "tqqq_pnl_pct": perf["tqqq_pnl_pct"],
+            "strategy_equity": round(strategy_equity, 2),
+            "strategy_pnl_day": round(strategy_pnl_day, 2),
+            "strategy_total_return_pct": round(strategy_total_return_pct, 2),
             "knn_direction": signals.knn_direction,
             "knn_confidence": signals.knn_confidence,
             "knn_adjustment": signals.knn_adjustment,
@@ -1186,6 +1547,11 @@ def cmd_run(halfday_check: bool = False):
             "xgb_confidence": signals.xgb_confidence,
             "xgb_adjustment": signals.xgb_adjustment,
             "xgb_probabilities": signals.xgb_probabilities,
+            "model_direction": signals.model_direction,
+            "model_confidence": signals.model_confidence,
+            "model_adjustment": signals.model_adjustment,
+            "model_source": signals.model_source,
+            "model_disagreement": signals.model_disagreement,
             "sqqq_current_shares": signals.sqqq_current_shares,
             "sqqq_position_value": sqqq_val,
             "sqqq_pnl_pct": perf["sqqq_pnl_pct"],
@@ -1267,6 +1633,11 @@ def cmd_status():
         xgb_probs = signals.xgb_probabilities
         print(f"  P(down)={xgb_probs[0]:.2f}  P(up)={xgb_probs[1]:.2f}")
 
+    # Effective model
+    print(f"\nEffective Model: {signals.model_direction} (conf={signals.model_confidence:.2f}, adj={signals.model_adjustment})")
+    print(f"  Source: {signals.model_source}")
+    print(f"  Disagreement: {'Yes' if signals.model_disagreement else 'No'}")
+
     # Position
     tqqq = data.tqqq_position
     if tqqq:
@@ -1347,9 +1718,16 @@ def cmd_backtest():
     import alpaca_client
     from db.models import get_connection, init_tables
     from db.cache import get_bars_with_cache
-    from strategy.regime import detect_regime, get_regime_target_pct
-    from strategy.signals import calculate_momentum, calculate_realized_vol, classify_vol_regime, get_vol_adjustment
+    from strategy.regime import detect_regime
+    from strategy.signals import calculate_momentum, calculate_realized_vol, classify_vol_regime
+    from strategy.sizing import (
+        run_gate_checklist,
+        calculate_target_shares,
+        run_sqqq_gate_checklist,
+        calculate_sqqq_target_shares,
+    )
     import notifications
+    from sklearn.metrics import roc_auc_score
 
     logger.info("Starting backtest...")
     init_tables()
@@ -1365,8 +1743,11 @@ def cmd_backtest():
     tqqq_bars = get_bars_with_cache(
         "TQQQ", 900, alpaca_client.fetch_bars_for_cache, conn
     )
+    sqqq_bars = get_bars_with_cache(
+        "SQQQ", 900, alpaca_client.fetch_bars_for_cache, conn
+    )
 
-    logger.info(f"QQQ bars: {len(qqq_bars)}, TQQQ bars: {len(tqqq_bars)}")
+    logger.info(f"QQQ bars: {len(qqq_bars)}, TQQQ bars: {len(tqqq_bars)}, SQQQ bars: {len(sqqq_bars)}")
 
     if len(qqq_bars) < 280:
         logger.error(f"Insufficient QQQ data: {len(qqq_bars)} bars (need 280+)")
@@ -1381,14 +1762,16 @@ def cmd_backtest():
     # Align dates
     qqq_by_date = {b["date"]: b for b in qqq_bars}
     tqqq_by_date = {b["date"]: b for b in tqqq_bars}
-    common_dates = sorted(set(qqq_by_date.keys()) & set(tqqq_by_date.keys()))
+    sqqq_by_date = {b["date"]: b for b in sqqq_bars}
+    common_dates = sorted(set(qqq_by_date.keys()) & set(tqqq_by_date.keys()) & set(sqqq_by_date.keys()))
 
     if len(common_dates) < 260:
         logger.error(f"Only {len(common_dates)} common dates, need 260+")
         return
 
-    # k-NN validation setup (walk-forward: train on first 300, predict on rest)
+    # Model validation setup (walk-forward: train on first 300, predict on rest)
     knn_model = None
+    xgb_model = None
     knn_bars = [qqq_by_date[dt] for dt in common_dates]  # chronological bars
     knn_train_cutoff = 300
     knn_stats = {
@@ -1398,6 +1781,14 @@ def cmd_backtest():
         "flat_count": 0,
         "regime_agree": 0, "regime_disagree": 0,
         "disagree_knn_right": 0, "disagree_knn_wrong": 0,
+        "scores": [], "labels": [],
+    }
+    xgb_stats = {
+        "correct": 0, "total": 0,
+        "long_correct": 0, "long_total": 0,
+        "short_correct": 0, "short_total": 0,
+        "flat_count": 0,
+        "scores": [], "labels": [],
     }
 
     # Fetch VIX data, cross-asset bars, and microstructure for k-NN/XGBoost features
@@ -1428,23 +1819,53 @@ def cmd_backtest():
 
     if LEVERAGE_CONFIG.get("use_knn_signal", False) and len(knn_bars) > knn_train_cutoff + 50:
         from strategy.knn_signal import KNNSignal, FeatureCalculator
+        from strategy.xgb_signal import XGBSignal
         knn_model = KNNSignal(n_neighbors=LEVERAGE_CONFIG.get("knn_neighbors", 7))
+        xgb_model = XGBSignal(
+            n_estimators=LEVERAGE_CONFIG.get("xgb_n_estimators", 200),
+            max_depth=LEVERAGE_CONFIG.get("xgb_max_depth", 4),
+            learning_rate=LEVERAGE_CONFIG.get("xgb_learning_rate", 0.05),
+        )
         if not knn_model.fit_from_bars(knn_bars[:knn_train_cutoff + 1], vix_by_date=vix_by_date, cross_asset_bars=cross_asset_bars, microstructure_by_date=microstructure_by_date):
             logger.warning("k-NN training failed for backtest validation")
             knn_model = None
         else:
             logger.info(f"k-NN trained on {knn_model.training_samples} samples for validation")
+        if not xgb_model.fit_from_bars(knn_bars[:knn_train_cutoff + 1], vix_by_date=vix_by_date, cross_asset_bars=cross_asset_bars, microstructure_by_date=microstructure_by_date):
+            logger.warning("XGBoost training failed for backtest validation")
+            xgb_model = None
 
     # Simulation
+    from strategy.position_manager import PositionManager
+
     initial_capital = 100000.0
     cash = initial_capital
-    shares = 0
+    tqqq_shares = 0
+    sqqq_shares = 0
     prev_regime = None
     regime_change_day = 0
     peak_value = initial_capital
     max_drawdown = 0.0
     num_trades = 0
     days_in_market = 0
+    prev_close_equity = initial_capital
+    pm = PositionManager(config=LEVERAGE_CONFIG)
+    position_meta = {
+        "TQQQ": {
+            "avg_entry_price": 0.0,
+            "entry_date": None,
+            "high_watermark": 0.0,
+            "tiers_taken": [],
+            "gate_fail_streak": 0,
+        },
+        "SQQQ": {
+            "avg_entry_price": 0.0,
+            "entry_date": None,
+            "high_watermark": 0.0,
+            "tiers_taken": [],
+            "gate_fail_streak": 0,
+        },
+    }
 
     results = []
     qqq_start_price = qqq_by_date[common_dates[250]]["close"]  # Start after warmup
@@ -1456,17 +1877,117 @@ def cmd_backtest():
 
         qqq_bar = qqq_by_date[dt]
         tqqq_bar = tqqq_by_date[dt]
+        sqqq_bar = sqqq_by_date[dt]
+        prev_dt = common_dates[i - 1] if i > 0 else None
+        prev_tqqq_bar = tqqq_by_date[prev_dt] if prev_dt else None
+        prev_sqqq_bar = sqqq_by_date[prev_dt] if prev_dt else None
+        had_exposure = tqqq_shares > 0 or sqqq_shares > 0
+        tqqq_just_exited = False
 
         # Build closes array
         warmup_dates = common_dates[max(0, i - 260):i + 1]
         closes = [qqq_by_date[d]["close"] for d in warmup_dates if d in qqq_by_date]
+        prior_dates = common_dates[max(0, i - 260):i]
+        prior_closes = [qqq_by_date[d]["close"] for d in prior_dates if d in qqq_by_date]
 
         if len(closes) < 250:
+            continue
+        if len(prior_closes) < 250:
             continue
 
         qqq_close = closes[-1]
         sma_50 = float(np.mean(closes[-50:]))
         sma_250 = float(np.mean(closes[-250:]))
+        sma_250_prev = float(np.mean(prior_closes[-250:]))
+
+        # Morning risk checks at the open.
+        morning_tqqq, morning_tqqq_price = _run_backtest_morning_window(
+            pm, "TQQQ", tqqq_shares, position_meta["TQQQ"], tqqq_bar, prev_tqqq_bar,
+            qqq_bar, prev_close_equity, sma_250_prev, dt,
+        )
+        if morning_tqqq and tqqq_shares > 0:
+            share_map = {"TQQQ": tqqq_shares, "SQQQ": sqqq_shares}
+            cash, traded = _apply_backtest_trade(
+                "TQQQ", -morning_tqqq.shares_to_sell, morning_tqqq_price, dt, cash,
+                share_map, position_meta,
+            )
+            if traded:
+                tqqq_shares = share_map["TQQQ"]
+                sqqq_shares = share_map["SQQQ"]
+                num_trades += 1
+                had_exposure = True
+                tqqq_just_exited = True
+
+        morning_sqqq, morning_sqqq_price = _run_backtest_morning_window(
+            pm, "SQQQ", sqqq_shares, position_meta["SQQQ"], sqqq_bar, prev_sqqq_bar,
+            qqq_bar, prev_close_equity, sma_250_prev, dt,
+        )
+        if morning_sqqq and sqqq_shares > 0:
+            share_map = {"TQQQ": tqqq_shares, "SQQQ": sqqq_shares}
+            cash, traded = _apply_backtest_trade(
+                "SQQQ", -morning_sqqq.shares_to_sell, morning_sqqq_price, dt, cash,
+                share_map, position_meta,
+            )
+            if traded:
+                tqqq_shares = share_map["TQQQ"]
+                sqqq_shares = share_map["SQQQ"]
+                num_trades += 1
+                had_exposure = True
+
+        # Midday risk and profit-taking checks.
+        midday_tqqq, midday_tqqq_price, _ = _run_backtest_midday_window(
+            pm, "TQQQ", tqqq_shares, position_meta["TQQQ"], tqqq_bar, prev_tqqq_bar,
+            prev_tqqq_bar["volume"] if prev_tqqq_bar else 0, prev_close_equity, dt,
+        )
+        if midday_tqqq and tqqq_shares > 0:
+            sell_shares = midday_tqqq.shares_to_sell or tqqq_shares
+            share_map = {"TQQQ": tqqq_shares, "SQQQ": sqqq_shares}
+            cash, traded = _apply_backtest_trade(
+                "TQQQ", -sell_shares, midday_tqqq_price, dt, cash, share_map, position_meta,
+            )
+            if traded:
+                if midday_tqqq.exit_type == "PARTIAL_PROFIT":
+                    favorable_state = _build_backtest_position_state(
+                        "TQQQ", tqqq_shares, position_meta["TQQQ"], tqqq_bar,
+                        prev_tqqq_bar, tqqq_bar["high"], dt,
+                    )
+                    gain_pct = ((favorable_state.current_price - favorable_state.avg_entry_price) / favorable_state.avg_entry_price) * 100 if favorable_state.avg_entry_price > 0 else 0
+                    for tier in LEVERAGE_CONFIG.get("pm_profit_tiers", []):
+                        if gain_pct >= tier["threshold_pct"] and tier["threshold_pct"] not in position_meta["TQQQ"]["tiers_taken"]:
+                            position_meta["TQQQ"]["tiers_taken"].append(tier["threshold_pct"])
+                            break
+                elif share_map["TQQQ"] == 0:
+                    tqqq_just_exited = True
+                tqqq_shares = share_map["TQQQ"]
+                sqqq_shares = share_map["SQQQ"]
+                num_trades += 1
+                had_exposure = True
+
+        midday_sqqq, midday_sqqq_price, _ = _run_backtest_midday_window(
+            pm, "SQQQ", sqqq_shares, position_meta["SQQQ"], sqqq_bar, prev_sqqq_bar,
+            prev_sqqq_bar["volume"] if prev_sqqq_bar else 0, prev_close_equity, dt,
+        )
+        if midday_sqqq and sqqq_shares > 0:
+            sell_shares = midday_sqqq.shares_to_sell or sqqq_shares
+            share_map = {"TQQQ": tqqq_shares, "SQQQ": sqqq_shares}
+            cash, traded = _apply_backtest_trade(
+                "SQQQ", -sell_shares, midday_sqqq_price, dt, cash, share_map, position_meta,
+            )
+            if traded:
+                if midday_sqqq.exit_type == "PARTIAL_PROFIT":
+                    favorable_state = _build_backtest_position_state(
+                        "SQQQ", sqqq_shares, position_meta["SQQQ"], sqqq_bar,
+                        prev_sqqq_bar, sqqq_bar["high"], dt,
+                    )
+                    gain_pct = ((favorable_state.current_price - favorable_state.avg_entry_price) / favorable_state.avg_entry_price) * 100 if favorable_state.avg_entry_price > 0 else 0
+                    for tier in LEVERAGE_CONFIG.get("pm_profit_tiers", []):
+                        if gain_pct >= tier["threshold_pct"] and tier["threshold_pct"] not in position_meta["SQQQ"]["tiers_taken"]:
+                            position_meta["SQQQ"]["tiers_taken"].append(tier["threshold_pct"])
+                            break
+                tqqq_shares = share_map["TQQQ"]
+                sqqq_shares = share_map["SQQQ"]
+                num_trades += 1
+                had_exposure = True
 
         # Regime
         regime = detect_regime(qqq_close, sma_50, sma_250)
@@ -1481,145 +2002,279 @@ def cmd_backtest():
             regime_change_day = i
             prev_regime = regime
 
-        # k-NN validation: predict and compare against actual next-day return
+        knn_dir = "FLAT"
+        knn_conf = 0.5
+        knn_adj = 1.0
+        xgb_dir = "FLAT"
+        xgb_conf = 0.5
+        xgb_adj = 1.0
+
+        # Walk-forward model predictions and validation
         if knn_model is not None and i >= knn_train_cutoff and i + 1 < len(common_dates):
-            features = FeatureCalculator.compute_features(knn_bars, i, vix_by_date=vix_by_date, cross_asset_bars=cross_asset_bars, microstructure_by_date=microstructure_by_date)
-            if features is not None:
-                X_scaled = knn_model.scaler.transform(features.reshape(1, -1))
-                probs = knn_model.model.predict_proba(X_scaled)[0]
-                p_up = float(probs[1]) if len(probs) > 1 else 0.5
-                confidence = max(p_up, float(probs[0]))
-
-                if confidence < knn_model.min_confidence:
-                    knn_dir = "FLAT"
-                    knn_stats["flat_count"] += 1
+            knn_result = knn_model.predict(knn_bars[:i + 1], vix_by_date=vix_by_date, cross_asset_bars=cross_asset_bars, microstructure_by_date=microstructure_by_date)
+            knn_dir = knn_result["direction"]
+            knn_conf = knn_result["confidence"]
+            knn_adj = knn_result["adjustment"]
+            next_dt = common_dates[i + 1]
+            actual_up = qqq_by_date[next_dt]["close"] > qqq_close
+            knn_stats["scores"].append(knn_result["probabilities"][1])
+            knn_stats["labels"].append(1 if actual_up else 0)
+            if knn_dir == "FLAT":
+                knn_stats["flat_count"] += 1
+            else:
+                predicted_up = knn_dir == "LONG"
+                knn_stats["total"] += 1
+                if predicted_up == actual_up:
+                    knn_stats["correct"] += 1
+                if knn_dir == "LONG":
+                    knn_stats["long_total"] += 1
+                    if actual_up:
+                        knn_stats["long_correct"] += 1
                 else:
-                    knn_dir = "LONG" if p_up > float(probs[0]) else "SHORT"
-
-                    # Actual next-day direction
-                    next_dt = common_dates[i + 1]
-                    actual_up = qqq_by_date[next_dt]["close"] > qqq_close
-                    predicted_up = knn_dir == "LONG"
-
-                    knn_stats["total"] += 1
+                    knn_stats["short_total"] += 1
+                    if not actual_up:
+                        knn_stats["short_correct"] += 1
+                regime_bullish = regime in ("STRONG_BULL", "BULL")
+                knn_bullish = knn_dir == "LONG"
+                if regime_bullish == knn_bullish:
+                    knn_stats["regime_agree"] += 1
+                else:
+                    knn_stats["regime_disagree"] += 1
                     if predicted_up == actual_up:
-                        knn_stats["correct"] += 1
-
-                    if knn_dir == "LONG":
-                        knn_stats["long_total"] += 1
-                        if actual_up:
-                            knn_stats["long_correct"] += 1
+                        knn_stats["disagree_knn_right"] += 1
                     else:
-                        knn_stats["short_total"] += 1
-                        if not actual_up:
-                            knn_stats["short_correct"] += 1
+                        knn_stats["disagree_knn_wrong"] += 1
 
-                    # Regime agreement analysis
-                    regime_bullish = regime in ("STRONG_BULL", "BULL")
-                    knn_bullish = knn_dir == "LONG"
-                    if regime_bullish == knn_bullish:
-                        knn_stats["regime_agree"] += 1
-                    else:
-                        knn_stats["regime_disagree"] += 1
-                        if predicted_up == actual_up:
-                            knn_stats["disagree_knn_right"] += 1
-                        else:
-                            knn_stats["disagree_knn_wrong"] += 1
+        if xgb_model is not None and i >= knn_train_cutoff and i + 1 < len(common_dates):
+            xgb_result = xgb_model.predict(knn_bars[:i + 1], vix_by_date=vix_by_date, cross_asset_bars=cross_asset_bars, microstructure_by_date=microstructure_by_date)
+            xgb_dir = xgb_result["direction"]
+            xgb_conf = xgb_result["confidence"]
+            xgb_adj = xgb_result["adjustment"]
+            next_dt = common_dates[i + 1]
+            actual_up = qqq_by_date[next_dt]["close"] > qqq_close
+            xgb_stats["scores"].append(xgb_result["probabilities"][1])
+            xgb_stats["labels"].append(1 if actual_up else 0)
+            if xgb_dir == "FLAT":
+                xgb_stats["flat_count"] += 1
+            else:
+                predicted_up = xgb_dir == "LONG"
+                xgb_stats["total"] += 1
+                if predicted_up == actual_up:
+                    xgb_stats["correct"] += 1
+                if xgb_dir == "LONG":
+                    xgb_stats["long_total"] += 1
+                    if actual_up:
+                        xgb_stats["long_correct"] += 1
+                else:
+                    xgb_stats["short_total"] += 1
+                    if not actual_up:
+                        xgb_stats["short_correct"] += 1
+
+        effective_model = _resolve_model_signal(knn_dir, knn_conf, knn_adj, xgb_dir, xgb_conf, xgb_adj)
 
         # Signals
         mom = calculate_momentum(closes)
         vol = calculate_realized_vol(closes)
         vol_regime = classify_vol_regime(vol)
-        vol_adj = get_vol_adjustment(vol_regime)
-
-        # Target allocation
-        regime_pct = get_regime_target_pct(regime)
-        target_pct = regime_pct
-
-        # Apply momentum scaling
-        if mom["score"] < LEVERAGE_CONFIG["min_momentum_score"]:
-            target_pct = LEVERAGE_CONFIG["min_position_pct"]
-        elif mom["score"] < 0.8:
-            min_pct = LEVERAGE_CONFIG["min_position_pct"]
-            scale = (mom["score"] - LEVERAGE_CONFIG["min_momentum_score"]) / (0.8 - LEVERAGE_CONFIG["min_momentum_score"])
-            target_pct = min_pct + (regime_pct - min_pct) * scale
-
-        # Vol adjustment
-        target_pct *= vol_adj
-
-        # Overextension check
-        if sma_50 > 0 and (qqq_close - sma_50) / sma_50 > LEVERAGE_CONFIG["mean_reversion_threshold"]:
-            target_pct *= 0.5
-
-        # Capital and shares
-        portfolio_value = cash + shares * tqqq_bar["close"]
+        portfolio_value = _backtest_portfolio_value(cash, tqqq_shares, sqqq_shares, tqqq_bar["close"], sqqq_bar["close"])
         allocated = portfolio_value * LEVERAGE_CONFIG["max_portfolio_pct"]
-        target_value = allocated * target_pct
-        target_shares = max(0, int(target_value / tqqq_bar["close"])) if tqqq_bar["close"] > 0 else 0
 
-        # Execute (at close price)
-        delta = target_shares - shares
-        if abs(delta * tqqq_bar["close"]) >= LEVERAGE_CONFIG["min_trade_value"] or (regime in ("RISK_OFF", "BREAKDOWN") and shares > 0):
-            if delta > 0:
-                cost = delta * tqqq_bar["close"]
-                if cost <= cash:
-                    shares += delta
-                    cash -= cost
-                    num_trades += 1
-            elif delta < 0:
-                proceeds = abs(delta) * tqqq_bar["close"]
-                shares += delta  # delta is negative
-                cash += proceeds
+        gate_data = {
+            "regime": regime,
+            "qqq_close": qqq_close,
+            "sma_50": sma_50,
+            "sma_250": sma_250,
+            "momentum_score": mom["score"],
+            "realized_vol": vol,
+            "vol_regime": vol_regime,
+            "daily_loss_pct": 0.0,
+            "qqq_closes": closes,
+            "holding_days_losing": 0,
+            "is_execution_window": True,
+            "allocated_capital": allocated,
+            "day_trades_remaining": 999,
+            "options_flow_bearish": False,
+            "options_flow_ratio": 1.0,
+            "trading_days_fetched": len(closes),
+            "current_shares": tqqq_shares,
+            "knn_direction": effective_model["direction"],
+            "knn_confidence": effective_model["confidence"],
+        }
+        tqqq_gates_passed, _ = run_gate_checklist(gate_data)
+        tqqq_target = calculate_target_shares({
+            "regime": regime,
+            "allocated_capital": allocated,
+            "momentum_score": mom["score"],
+            "vol_regime": vol_regime,
+            "options_flow_adjustment": 1.0,
+            "qqq_close": qqq_close,
+            "sma_50": sma_50,
+            "qqq_closes": closes,
+            "tqqq_price": tqqq_bar["close"],
+            "current_shares": tqqq_shares,
+            "model_direction": effective_model["direction"],
+            "model_confidence": effective_model["confidence"],
+            "model_disagreement": effective_model["disagreement"],
+            "knn_adjustment": effective_model["adjustment"],
+        })
+        is_emergency = regime in ("RISK_OFF", "BREAKDOWN")
+        is_exit_or_reduction = tqqq_target["action"] in ("EXIT", "SELL")
+        should_trade_tqqq = tqqq_gates_passed or is_emergency or is_exit_or_reduction
+
+        stale_max = LEVERAGE_CONFIG.get("stale_position_max_days", 5)
+        if tqqq_shares > 0 and not should_trade_tqqq and not is_emergency:
+            position_meta["TQQQ"]["gate_fail_streak"] += 1
+            if position_meta["TQQQ"]["gate_fail_streak"] >= stale_max:
+                tqqq_target["action"] = "EXIT"
+                tqqq_target["target_shares"] = 0
+                tqqq_target["delta_shares"] = -tqqq_shares
+                tqqq_target["delta_value"] = -tqqq_shares * tqqq_bar["close"]
+                should_trade_tqqq = True
+        else:
+            position_meta["TQQQ"]["gate_fail_streak"] = 0
+
+        sqqq_gate_data = {
+            "knn_direction": effective_model["direction"],
+            "knn_confidence": effective_model["confidence"],
+            "vol_regime": vol_regime,
+            "allocated_capital": allocated,
+            "is_execution_window": True,
+            "day_trades_remaining": 999,
+            "trading_days_fetched": len(closes),
+            "has_tqqq_position": tqqq_shares > 0,
+            "regime": regime,
+            "tqqq_just_exited": tqqq_just_exited,
+            "pct_above_sma50": ((qqq_close / sma_50) - 1) if sma_50 > 0 else 0.0,
+            "roc_slow": mom["roc_slow"],
+            "raw_knn_direction": knn_dir,
+            "raw_knn_confidence": knn_conf,
+            "raw_xgb_direction": xgb_dir,
+            "raw_xgb_confidence": xgb_conf,
+        }
+        sqqq_gates_passed, _ = run_sqqq_gate_checklist(sqqq_gate_data)
+        sqqq_target = calculate_sqqq_target_shares({
+            "knn_direction": effective_model["direction"],
+            "knn_confidence": effective_model["confidence"],
+            "vol_regime": vol_regime,
+            "allocated_capital": allocated,
+            "sqqq_price": sqqq_bar["close"],
+            "current_shares": sqqq_shares,
+            "regime": regime,
+            "pct_above_sma50": ((qqq_close / sma_50) - 1) if sma_50 > 0 else 0.0,
+            "roc_slow": mom["roc_slow"],
+            "raw_knn_direction": knn_dir,
+            "raw_knn_confidence": knn_conf,
+            "raw_xgb_direction": xgb_dir,
+            "raw_xgb_confidence": xgb_conf,
+        })
+
+        # Mutual exclusivity: if long sleeve is valid, flatten inverse first.
+        if sqqq_shares > 0 and (tqqq_gates_passed or sqqq_target["target_shares"] == 0):
+            share_map = {"TQQQ": tqqq_shares, "SQQQ": sqqq_shares}
+            cash, traded = _apply_backtest_trade(
+                "SQQQ", -sqqq_shares, sqqq_bar["close"], dt, cash, share_map, position_meta,
+            )
+            if traded:
+                tqqq_shares = share_map["TQQQ"]
+                sqqq_shares = share_map["SQQQ"]
                 num_trades += 1
+                had_exposure = True
 
-                # Ensure no negative shares
-                if shares < 0:
-                    cash += abs(shares) * tqqq_bar["close"]
-                    shares = 0
+        # Execute TQQQ rebalance at close.
+        tqqq_delta = tqqq_target["target_shares"] - tqqq_shares
+        if tqqq_delta > 0 and tqqq_target["action"] == "BUY":
+            share_map = {"TQQQ": tqqq_shares, "SQQQ": sqqq_shares}
+            cash, traded = _apply_backtest_trade(
+                "TQQQ", tqqq_delta, tqqq_bar["close"], dt, cash, share_map, position_meta,
+            )
+            if traded:
+                tqqq_shares = share_map["TQQQ"]
+                sqqq_shares = share_map["SQQQ"]
+                num_trades += 1
+        elif tqqq_delta < 0 and tqqq_target["action"] in ("SELL", "EXIT"):
+            share_map = {"TQQQ": tqqq_shares, "SQQQ": sqqq_shares}
+            cash, traded = _apply_backtest_trade(
+                "TQQQ", tqqq_delta, tqqq_bar["close"], dt, cash, share_map, position_meta,
+            )
+            if traded:
+                tqqq_shares = share_map["TQQQ"]
+                sqqq_shares = share_map["SQQQ"]
+                num_trades += 1
+                if tqqq_shares == 0:
+                    tqqq_just_exited = True
 
-        portfolio_value = cash + shares * tqqq_bar["close"]
+        # Enter/resize SQQQ only when long sleeve is not active.
+        if tqqq_shares == 0:
+            sqqq_delta = sqqq_target["target_shares"] - sqqq_shares
+            if sqqq_delta > 0 and sqqq_gates_passed and sqqq_target["action"] == "BUY":
+                share_map = {"TQQQ": tqqq_shares, "SQQQ": sqqq_shares}
+                cash, traded = _apply_backtest_trade(
+                    "SQQQ", sqqq_delta, sqqq_bar["close"], dt, cash, share_map, position_meta,
+                )
+                if traded:
+                    tqqq_shares = share_map["TQQQ"]
+                    sqqq_shares = share_map["SQQQ"]
+                    num_trades += 1
+            elif sqqq_delta < 0 and sqqq_target["action"] in ("SELL", "EXIT"):
+                share_map = {"TQQQ": tqqq_shares, "SQQQ": sqqq_shares}
+                cash, traded = _apply_backtest_trade(
+                    "SQQQ", sqqq_delta, sqqq_bar["close"], dt, cash, share_map, position_meta,
+                )
+                if traded:
+                    tqqq_shares = share_map["TQQQ"]
+                    sqqq_shares = share_map["SQQQ"]
+                    num_trades += 1
+
+        portfolio_value = _backtest_portfolio_value(cash, tqqq_shares, sqqq_shares, tqqq_bar["close"], sqqq_bar["close"])
         peak_value = max(peak_value, portfolio_value)
         drawdown = (peak_value - portfolio_value) / peak_value * 100
         max_drawdown = max(max_drawdown, drawdown)
 
-        if shares > 0:
+        if had_exposure or tqqq_shares > 0 or sqqq_shares > 0:
             days_in_market += 1
 
         # Benchmarks
         qqq_return = (qqq_bar["close"] / qqq_start_price - 1) * 100
         tqqq_return = (tqqq_bar["close"] / tqqq_start_price - 1) * 100
         strategy_return = (portfolio_value / initial_capital - 1) * 100
+        pnl_day = portfolio_value - prev_close_equity
 
         results.append({
             "date": dt,
             "qqq_close": qqq_close,
             "tqqq_close": tqqq_bar["close"],
+            "sqqq_close": sqqq_bar["close"],
             "regime": regime,
-            "target_shares": target_shares,
-            "held_shares": shares,
+            "target_shares": tqqq_target["target_shares"],
+            "held_shares": tqqq_shares,
+            "sqqq_shares": sqqq_shares,
+            "effective_model_direction": effective_model["direction"],
+            "model_source": effective_model["source"],
             "portfolio_value": round(portfolio_value, 2),
             "cash": round(cash, 2),
-            "pnl_day": 0,  # Simplified
+            "pnl_day": round(pnl_day, 2),
             "pnl_total_pct": round(strategy_return, 2),
             "drawdown_pct": round(drawdown, 2),
             "qqq_buy_hold_pct": round(qqq_return, 2),
             "tqqq_buy_hold_pct": round(tqqq_return, 2),
         })
+        prev_close_equity = portfolio_value
 
     # Write results to DB
     conn.executemany(
-        "INSERT INTO backtest_results (date, qqq_close, tqqq_close, regime, target_shares, "
-        "held_shares, portfolio_value, cash, pnl_day, pnl_total_pct, drawdown_pct, "
-        "qqq_buy_hold_pct, tqqq_buy_hold_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [(r["date"], r["qqq_close"], r["tqqq_close"], r["regime"], r["target_shares"],
-          r["held_shares"], r["portfolio_value"], r["cash"], r["pnl_day"],
+        "INSERT INTO backtest_results (date, qqq_close, tqqq_close, sqqq_close, regime, target_shares, "
+        "held_shares, sqqq_shares, effective_model_direction, model_source, portfolio_value, cash, pnl_day, pnl_total_pct, drawdown_pct, "
+        "qqq_buy_hold_pct, tqqq_buy_hold_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [(r["date"], r["qqq_close"], r["tqqq_close"], r["sqqq_close"], r["regime"], r["target_shares"],
+          r["held_shares"], r["sqqq_shares"], r["effective_model_direction"], r["model_source"], r["portfolio_value"], r["cash"], r["pnl_day"],
           r["pnl_total_pct"], r["drawdown_pct"], r["qqq_buy_hold_pct"],
           r["tqqq_buy_hold_pct"]) for r in results],
     )
     conn.commit()
 
     # Export CSV
-    csv_path = DATA_DIR / "backtest_results.csv"
+    from config import DATA_DIR as runtime_data_dir
+    csv_path = runtime_data_dir / "backtest_results.csv"
     df = pd.DataFrame(results)
     df.to_csv(csv_path, index=False)
     logger.info(f"Backtest results saved to {csv_path}")
@@ -1681,6 +2336,27 @@ def cmd_backtest():
         stats["knn_regime_agreement"] = round(agree_rate, 1)
         stats["knn_disagreement_accuracy"] = round(disagree_acc, 1)
         stats["knn_test_predictions"] = ks["total"]
+
+    if xgb_model is not None and xgb_stats["total"] > 0:
+        xs = xgb_stats
+        xgb_accuracy = xs["correct"] / xs["total"] * 100
+        xgb_long_acc = (xs["long_correct"] / xs["long_total"] * 100) if xs["long_total"] > 0 else 0
+        xgb_short_acc = (xs["short_correct"] / xs["short_total"] * 100) if xs["short_total"] > 0 else 0
+        xgb_auc = roc_auc_score(xs["labels"], xs["scores"]) if len(set(xs["labels"])) > 1 else 0.5
+        print(f"{'='*50}")
+        print(f"  XGBOOST SIGNAL VALIDATION")
+        print(f"{'='*50}")
+        print(f"  Test predictions: {xs['total']} (+ {xs['flat_count']} FLAT skipped)")
+        print(f"  Overall accuracy: {xgb_accuracy:.1f}% ({xs['correct']}/{xs['total']})")
+        print(f"    LONG:  {xgb_long_acc:.1f}% ({xs['long_correct']}/{xs['long_total']})")
+        print(f"    SHORT: {xgb_short_acc:.1f}% ({xs['short_correct']}/{xs['short_total']})")
+        print(f"  ROC AUC: {xgb_auc:.3f}")
+        print(f"{'='*50}\n")
+        stats["xgb_accuracy"] = round(xgb_accuracy, 1)
+        stats["xgb_long_accuracy"] = round(xgb_long_acc, 1)
+        stats["xgb_short_accuracy"] = round(xgb_short_acc, 1)
+        stats["xgb_auc"] = round(xgb_auc, 3)
+        stats["xgb_test_predictions"] = xs["total"]
 
     # Send to Telegram
     notifications.send_backtest_summary(stats, str(csv_path))

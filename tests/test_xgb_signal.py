@@ -97,7 +97,7 @@ class TestXGBSignal:
         assert xgb.fit_from_bars(bars) is True
         assert xgb.is_fitted
         assert xgb.training_samples > 200
-        assert xgb.feature_count == 20
+        assert xgb.feature_count == FeatureCalculator.FEATURE_COUNT
 
     def test_fit_with_vix_and_cross_asset(self):
         bars = _make_bars(500)
@@ -113,7 +113,7 @@ class TestXGBSignal:
         xgb = XGBSignal(n_estimators=50, max_depth=3)
         assert xgb.fit_from_bars(bars, microstructure_by_date=micro) is True
         assert xgb.is_fitted
-        assert xgb.feature_count == 20
+        assert xgb.feature_count == FeatureCalculator.FEATURE_COUNT
 
     def test_fit_returns_false_with_insufficient_data(self):
         bars = _make_bars(100)
@@ -182,7 +182,7 @@ class TestXGBSignal:
         xgb2 = XGBSignal()
         assert xgb2.load(model_path) is True
         assert xgb2.is_fitted
-        assert xgb2.feature_count == 20
+        assert xgb2.feature_count == FeatureCalculator.FEATURE_COUNT
         assert xgb2.feature_version == FEATURE_VERSION
         loaded_pred = xgb2.predict(bars)
 
@@ -239,7 +239,7 @@ class TestXGBSignal:
         xgb = XGBSignal(n_estimators=50, max_depth=3)
         xgb.fit_from_bars(bars)
         importances = xgb.get_feature_importance()
-        assert len(importances) == 20
+        assert len(importances) == FeatureCalculator.FEATURE_COUNT
         # Should be sorted by importance (descending)
         for i in range(len(importances) - 1):
             assert importances[i][1] >= importances[i + 1][1]

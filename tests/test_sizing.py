@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
 import numpy as np
+from unittest.mock import patch
 from strategy.sizing import get_allocated_capital, run_gate_checklist, calculate_target_shares
 
 
@@ -44,6 +45,12 @@ class TestAllocatedCapital:
 
 
 class TestGateChecklist:
+    @pytest.fixture(autouse=True)
+    def _legacy_path(self):
+        """Gate checklist tests target the legacy (non-sleeve) path."""
+        with patch.dict("config.LEVERAGE_CONFIG", {"use_rule_sleeves": False}, clear=False):
+            yield
+
     def _make_gate_data(self, **overrides):
         """Create default gate data that passes all gates (incl. RSI overbought)."""
         np.random.seed(123)
@@ -67,6 +74,9 @@ class TestGateChecklist:
             "options_flow_bearish": False,
             "options_flow_ratio": 0.8,
             "trading_days_fetched": 278,
+            "current_shares": 0,
+            "knn_direction": "LONG",
+            "knn_confidence": 0.65,
         }
         data.update(overrides)
         return data
@@ -146,22 +156,47 @@ class TestGateChecklist:
         passed, failed = run_gate_checklist(data)
         assert "holding_days" in failed
 
-    def test_gate_rsi_overbought_fail(self):
-        """RSI above threshold blocks entry."""
+    def test_gate_rsi_overbought_does_not_block(self):
+        """RSI above threshold is handled in sizing, not as a hard gate failure."""
         # Monotonically rising closes → RSI near 100
         closes = list(np.linspace(400, 550, 300))
         data = self._make_gate_data(qqq_closes=closes)
         passed, failed = run_gate_checklist(data)
-        assert "rsi_overbought" in failed
+        assert "rsi_overbought" not in failed
 
     def test_multiple_gates_fail(self):
         data = self._make_gate_data(regime="RISK_OFF", momentum_score=0.1, realized_vol=40)
         passed, failed = run_gate_checklist(data)
         assert len(failed) >= 3
 
+    def test_gate_model_bearish_blocks_bull_regime_entry(self):
+        with patch.dict("config.LEVERAGE_CONFIG", {
+            "long_model_short_block_confidence": 0.60,
+            "long_model_short_bull_max_position_pct": 0.0,
+            "long_model_short_strong_bull_max_position_pct": 0.0,
+        }, clear=False):
+            data = self._make_gate_data(knn_direction="SHORT", knn_confidence=0.65)
+            passed, failed = run_gate_checklist(data)
+            assert passed is False
+            assert "model_bearish" in failed
+
+    def test_gate_model_neutral_blocks_new_entry(self):
+        with patch.dict("config.LEVERAGE_CONFIG", {"long_require_model_support_for_new_entries": True}, clear=False):
+            data = self._make_gate_data(knn_direction="FLAT", knn_confidence=0.50, current_shares=0)
+            passed, failed = run_gate_checklist(data)
+            assert passed is False
+            assert "model_neutral" in failed
+
 
 class TestCalculateTargetShares:
+    @pytest.fixture(autouse=True)
+    def _legacy_path(self):
+        """Sizing tests target the legacy (non-sleeve) math; sleeve engine has its own tests."""
+        with patch.dict("config.LEVERAGE_CONFIG", {"use_rule_sleeves": False}, clear=False):
+            yield
+
     def test_strong_bull_full_allocation(self):
+        closes = [500 + (i % 9) * 0.4 + ((-1) ** i) * 0.8 for i in range(300)]
         data = {
             "regime": "STRONG_BULL",
             "allocated_capital": 38700,
@@ -170,14 +205,17 @@ class TestCalculateTargetShares:
             "options_flow_adjustment": 1.0,
             "qqq_close": 550,
             "sma_50": 520,
-            "qqq_closes": [500 + i * 0.2 for i in range(300)],
+            "qqq_closes": closes,
             "tqqq_price": 50.64,
             "current_shares": 0,
+            "model_direction": "LONG",
+            "model_confidence": 0.65,
+            "model_disagreement": False,
         }
         result = calculate_target_shares(data)
-        # 70% of 38.7K = 27.09K / 50.64 = ~535 shares
-        assert result["target_shares"] > 400
-        assert result["target_shares"] < 600
+        # 20% of 38.7K = 7.74K / 50.64 = ~152 shares
+        assert result["target_shares"] > 140
+        assert result["target_shares"] < 180
         assert result["action"] == "BUY"
 
     def test_risk_off_exit(self):
@@ -192,6 +230,9 @@ class TestCalculateTargetShares:
             "qqq_closes": [500 - i * 0.1 for i in range(300)],
             "tqqq_price": 30.0,
             "current_shares": 300,
+            "model_direction": "FLAT",
+            "model_confidence": 0.5,
+            "model_disagreement": False,
         }
         result = calculate_target_shares(data)
         assert result["target_shares"] == 0
@@ -208,7 +249,10 @@ class TestCalculateTargetShares:
             "sma_50": 510,
             "qqq_closes": [490 + i * 0.15 for i in range(300)],
             "tqqq_price": 50.0,
-            "current_shares": 387,  # 50% of 38.7K / 50 = 387
+            "current_shares": 116,  # 15% of 38.7K / 50 = ~116
+            "model_direction": "LONG",
+            "model_confidence": 0.65,
+            "model_disagreement": False,
         }
         result = calculate_target_shares(data)
         assert result["action"] == "HOLD"
@@ -225,10 +269,13 @@ class TestCalculateTargetShares:
             "qqq_closes": [500 + i * 0.2 for i in range(300)],
             "tqqq_price": 50.0,
             "current_shares": 0,
+            "model_direction": "LONG",
+            "model_confidence": 0.65,
+            "model_disagreement": False,
         }
         result = calculate_target_shares(data)
-        # 70% * 0.5 (vol) = 35% of 38.7K = 13.5K / 50 = ~270
-        assert result["target_shares"] < 300
+        # 20% * 0.5 (vol) = 10% of 38.7K = 3.87K / 50 = ~77
+        assert result["target_shares"] < 100
         assert "vol=HIGH" in str(result["limiting_factors"])
 
     def test_vol_extreme_goes_to_cash(self):
@@ -243,6 +290,9 @@ class TestCalculateTargetShares:
             "qqq_closes": [500 + i * 0.2 for i in range(300)],
             "tqqq_price": 50.0,
             "current_shares": 300,
+            "model_direction": "LONG",
+            "model_confidence": 0.65,
+            "model_disagreement": False,
         }
         result = calculate_target_shares(data)
         assert result["target_shares"] == 0
@@ -259,10 +309,13 @@ class TestCalculateTargetShares:
             "qqq_closes": [500 + i * 0.2 for i in range(300)],
             "tqqq_price": 50.0,
             "current_shares": 0,
+            "model_direction": "LONG",
+            "model_confidence": 0.65,
+            "model_disagreement": False,
         }
         result = calculate_target_shares(data)
-        # 70% * 0.75 = 52.5% of 38.7K = 20.3K / 50 = ~406
-        assert result["target_shares"] < 430
+        # 20% * 0.75 = 15% of 38.7K = 5.8K / 50 = ~116
+        assert result["target_shares"] < 130
         assert "flow_bearish" in str(result["limiting_factors"])
 
     def test_low_momentum_reduces_to_minimum(self):
@@ -277,6 +330,9 @@ class TestCalculateTargetShares:
             "qqq_closes": [500 + i * 0.2 for i in range(300)],
             "tqqq_price": 50.0,
             "current_shares": 0,
+            "model_direction": "LONG",
+            "model_confidence": 0.65,
+            "model_disagreement": False,
         }
         result = calculate_target_shares(data)
         # min_position_pct = 0.10 → 10% of 38.7K = 3870 / 50 = ~77
@@ -297,3 +353,114 @@ class TestCalculateTargetShares:
         }
         result = calculate_target_shares(data)
         assert result["target_shares"] >= 0
+
+    def test_overbought_flat_book_still_buys_reduced_tqqq(self):
+        closes = list(np.linspace(400, 550, 300))
+        data = {
+            "regime": "STRONG_BULL",
+            "allocated_capital": 38700,
+            "momentum_score": 0.85,
+            "vol_regime": "NORMAL",
+            "options_flow_adjustment": 1.0,
+            "qqq_close": 550,
+            "sma_50": 520,
+            "qqq_closes": closes,
+            "tqqq_price": 50.0,
+            "current_shares": 0,
+            "model_direction": "LONG",
+            "model_confidence": 0.65,
+            "model_disagreement": False,
+        }
+        result = calculate_target_shares(data)
+        assert result["action"] == "BUY"
+        assert result["target_shares"] > 0
+        assert result["target_shares"] < 130
+        assert "rsi_overbought_pause_adds" in str(result["limiting_factors"])
+
+    def test_overbought_existing_position_pauses_adds(self):
+        closes = list(np.linspace(400, 550, 300))
+        data = {
+            "regime": "STRONG_BULL",
+            "allocated_capital": 38700,
+            "momentum_score": 0.85,
+            "vol_regime": "NORMAL",
+            "options_flow_adjustment": 1.0,
+            "qqq_close": 550,
+            "sma_50": 520,
+            "qqq_closes": closes,
+            "tqqq_price": 50.0,
+            "current_shares": 120,
+            "model_direction": "LONG",
+            "model_confidence": 0.65,
+            "model_disagreement": False,
+        }
+        result = calculate_target_shares(data)
+        assert result["target_shares"] == 120
+        assert result["action"] == "HOLD"
+
+    def test_model_neutral_flat_book_gets_capped_long(self):
+        closes = [500 + (i % 7) * 0.3 + ((-1) ** i) * 0.7 for i in range(300)]
+        data = {
+            "regime": "STRONG_BULL",
+            "allocated_capital": 38700,
+            "momentum_score": 0.85,
+            "vol_regime": "NORMAL",
+            "options_flow_adjustment": 1.0,
+            "qqq_close": 550,
+            "sma_50": 520,
+            "qqq_closes": closes,
+            "tqqq_price": 50.0,
+            "current_shares": 0,
+            "model_direction": "FLAT",
+            "model_confidence": 0.50,
+            "model_disagreement": False,
+        }
+        result = calculate_target_shares(data)
+        assert result["target_shares"] > 0
+        assert result["target_shares"] <= int((38700 * 0.18) / 50.0)
+        assert "model_neutral_cap" in str(result["limiting_factors"])
+
+    def test_model_disagreement_caps_existing_long(self):
+        closes = [500 + (i % 7) * 0.3 + ((-1) ** i) * 0.7 for i in range(300)]
+        with patch.dict("config.LEVERAGE_CONFIG", {"long_disagreement_max_position_pct": 0.10}, clear=False):
+            data = {
+                "regime": "STRONG_BULL",
+                "allocated_capital": 38700,
+                "momentum_score": 0.85,
+                "vol_regime": "NORMAL",
+                "options_flow_adjustment": 1.0,
+                "qqq_close": 550,
+                "sma_50": 520,
+                "qqq_closes": closes,
+                "tqqq_price": 50.0,
+                "current_shares": 300,
+                "model_direction": "LONG",
+                "model_confidence": 0.62,
+                "model_disagreement": True,
+            }
+            result = calculate_target_shares(data)
+            assert result["target_shares"] <= int((38700 * 0.10) / 50.0)
+            assert result["action"] == "SELL"
+            assert "model_disagreement_cap" in str(result["limiting_factors"])
+
+    def test_model_bearish_strong_bull_keeps_reduced_long(self):
+        data = {
+            "regime": "STRONG_BULL",
+            "allocated_capital": 38700,
+            "momentum_score": 0.85,
+            "vol_regime": "NORMAL",
+            "options_flow_adjustment": 1.0,
+            "qqq_close": 550,
+            "sma_50": 520,
+            "qqq_closes": [500 + i * 0.2 for i in range(300)],
+            "tqqq_price": 50.0,
+            "current_shares": 0,
+            "model_direction": "SHORT",
+            "model_confidence": 0.72,
+            "model_disagreement": False,
+        }
+        result = calculate_target_shares(data)
+        assert result["target_shares"] > 0
+        assert result["target_shares"] <= int((38700 * 0.15) / 50.0)
+        assert result["action"] == "BUY"
+        assert "model_bearish_cap_strong_bull" in str(result["limiting_factors"])

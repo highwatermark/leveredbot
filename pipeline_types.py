@@ -78,3 +78,9 @@ class StrategySignals:
     xgb_confidence: float = 0.5
     xgb_adjustment: float = 1.0
     xgb_probabilities: list[float] = field(default_factory=lambda: [0.5, 0.5])
+    # Effective model arbitration layer used by sizing / side selection
+    model_direction: str = "FLAT"
+    model_confidence: float = 0.5
+    model_adjustment: float = 1.0
+    model_source: str = "neutral"
+    model_disagreement: bool = False
