@@ -174,6 +174,12 @@ LEVERAGE_CONFIG = {
     "sqqq_trend_position_pct": 0.30,      # Fraction of sqqq_max_position_pct for trend entries
     "sqqq_max_position_pct": 0.40,        # Max 40% of allocated capital in SQQQ
 
+    # Cash-yield sweep — idle allocated capital parked in T-bills (2026-06-10)
+    "use_cash_sweep": True,
+    "sweep_etf": "SGOV",                # 0-3 month T-bill ETF, ~penny spread
+    "sweep_buffer_pct": 0.02,           # keep 2% of allocated as raw cash
+    "sweep_min_trade_value": 250,       # don't churn sub-$250 sweep deltas
+
     # Stale position protection
     "stale_position_max_days": 5,       # Force exit after N consecutive gate-fail days while holding
 

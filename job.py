@@ -1309,11 +1309,23 @@ def cmd_run(halfday_check: bool = False):
 
         # Execute trade and update decision with results
         execution_result = {"executed": False, "action": "HOLD", "order": None, "reason": "Gates failed"}
+        sweep_presold = False
 
         if will_trade:
             try:
                 # Sells/exits bypass PDT — selling shares bought on a prior day isn't a day trade
                 is_selling = target["action"] in ("EXIT", "SELL")
+                # Free cash from the T-bill sweep before a buy so the order can't bounce
+                if not is_selling and target.get("delta_value", 0) > 0:
+                    from strategy.cash_sweep import free_cash_for_buy
+                    presell = free_cash_for_buy(
+                        alpaca_client,
+                        target["delta_value"],
+                        signals.capital.get("cash_available", 0),
+                    )
+                    sweep_presold = presell["sold"]
+                    if sweep_presold:
+                        logger.info(f"Cash sweep: {presell['reason']}")
                 execution_result = execute_rebalance(
                     target["target_shares"],
                     signals.current_shares,
@@ -1423,6 +1435,30 @@ def cmd_run(halfday_check: bool = False):
                 sqqq_decision["order_id"] = sqqq_order.get("order_id")
                 sqqq_decision["fill_price"] = sqqq_order.get("filled_avg_price")
                 log_daily_decision(sqqq_decision, conn)
+
+        # ── Cash-yield sweep: park idle allocated capital in T-bills (non-fatal) ──
+        if LEVERAGE_CONFIG.get("use_cash_sweep", False):
+            try:
+                from strategy.cash_sweep import execute_sweep
+                fresh_positions = alpaca_client.get_positions()
+                strat_value = sum(
+                    abs(p.get("market_value", 0)) for p in fresh_positions
+                    if p["symbol"] in (LEVERAGE_CONFIG["bull_etf"], LEVERAGE_CONFIG["bear_etf"])
+                )
+                # If a TQQQ buy just executed, floor at target value in case the
+                # fill hasn't reflected in the positions API yet
+                if execution_result.get("executed") and target["action"] == "BUY":
+                    strat_value = max(strat_value, target["target_shares"] * signals.tqqq_price)
+                sweep_result = execute_sweep(
+                    alpaca_client,
+                    signals.allocated_capital,
+                    strat_value,
+                    skip_buy=sweep_presold,
+                )
+                if sweep_result.get("executed"):
+                    logger.info(f"Cash sweep: {sweep_result['reason']}")
+            except Exception as e:
+                logger.warning(f"Cash sweep failed (non-fatal): {e}")
 
         # Log regime change
         if signals.regime_changed and signals.previous_regime:

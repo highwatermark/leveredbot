@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-06-10 (3) — Cash-yield sweep (SGOV)
+
+Idle allocated capital (historically ~74% of the sleeve at the 3x tier) now
+sweeps into SGOV (0-3 month T-bills, ~4-5% yield) at the main run and is sold
+automatically when TQQQ needs the room. Decade replay estimate: adds ~+3%/yr.
+
+- `strategy/cash_sweep.py`: target math, pre-sell before TQQQ buys
+  (1%-padded shortfall), end-of-run sweep; never sells and rebuys same run;
+  no same-day round trips (PDT-safe)
+- `get_allocated_capital`: sweep ETF classed as strategy capital — does not
+  shrink allocation (critical on a dedicated account) or count as "other"
+- Config: `use_cash_sweep: True`, `sweep_etf: SGOV`, `sweep_buffer_pct: 0.02`,
+  `sweep_min_trade_value: 250`
+- Sweep failures are non-fatal: the strategy run never breaks on sweep errors
+
 ## 2026-06-10 (2) — Sizing raised to 3x tier after decade stress-test
 
 Replayed the new system through 2018 Q4, COVID 2020, the 2022 bear, and the

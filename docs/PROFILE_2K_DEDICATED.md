@@ -20,6 +20,13 @@ momentum-agent). Chosen 2026-06-10 after the decade stress-test
 2. Set `max_portfolio_pct: 1.0` in `config.py`.
 3. Deploy + set up the same cron schedule (see CLAUDE.md / server crontab).
 
+## Cash sweep at this size
+
+The SGOV sweep (`use_cash_sweep: True`) works unchanged: idle capital
+(~$1,000–1,400 typically) holds ~10–14 SGOV shares. `sweep_min_trade_value:
+250` means the sweep adjusts in ≥$250 steps — at this account size it will
+rebalance the sweep every few weeks, which is correct (don't lower it).
+
 ## Expectations at this tier (from the 2017–2026 replay, $2k start)
 
 - CAGR ≈ 17% → $2k ≈ $8.5k over a decade

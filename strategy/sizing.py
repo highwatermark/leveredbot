@@ -53,9 +53,11 @@ def get_allocated_capital(
 
     bull_etf = LEVERAGE_CONFIG["bull_etf"]
     bear_etf = LEVERAGE_CONFIG["bear_etf"]
+    sweep_etf = LEVERAGE_CONFIG.get("sweep_etf", "SGOV") if LEVERAGE_CONFIG.get("use_cash_sweep", False) else None
     other_value = 0.0
     tqqq_value = 0.0
     sqqq_value = 0.0
+    sweep_value = 0.0
 
     for pos in positions:
         sym = pos["symbol"]
@@ -63,6 +65,9 @@ def get_allocated_capital(
             tqqq_value = abs(pos.get("market_value", 0))
         elif sym == bear_etf:
             sqqq_value = abs(pos.get("market_value", 0))
+        elif sym == sweep_etf:
+            # Sweep ETF is the strategy's own idle capital — must not shrink allocation
+            sweep_value = abs(pos.get("market_value", 0))
         else:
             other_value += abs(pos.get("market_value", 0))
 
@@ -76,9 +81,10 @@ def get_allocated_capital(
         "other_positions_value": other_value,
         "tqqq_position_value": tqqq_value,
         "sqqq_position_value": sqqq_value,
+        "sweep_position_value": sweep_value,
         "strategy_position_value": strategy_value,
         "allocated_capital": available,
-        "cash_available": equity - other_value - strategy_value,
+        "cash_available": equity - other_value - strategy_value - sweep_value,
     }
 
 
